@@ -88,39 +88,32 @@ impl KernelGraphics {
 
 // The actual kernel entry point after ExitBootServices
 pub fn kernel_main(fb_info: FramebufferInfo) -> ! {
-    // We are now running without UEFI!
-    let gfx = KernelGraphics::new(fb_info);
+    // Initialize terminal first
+    crate::terminal::init(fb_info);
     
-    // Clear screen to dark background
-    gfx.clear(0x0A0A0A);
+    // Clear screen and show boot messages
+    crate::terminal::print("ilo-lawa OS v0.3.0\n");
+    crate::terminal::print("===================\n\n");
+    crate::terminal::print("System Initialization:\n");
     
-    // Draw title bar
-    gfx.draw_rect(0, 0, fb_info.width, 40, 0x1A1A2E);
-    gfx.draw_text(10, 10, "ilo-lawa OS v0.2.0 - Independent Kernel Mode", 0xFFFFFF, None);
+    // TEMPORARY: Skip interrupt system for now
+    crate::terminal::print("[SKIP] Interrupt system disabled for debugging\n");
+    crate::terminal::print("[OK] Terminal initialized\n\n");
     
-    // Draw welcome message with proper font rendering
-    gfx.draw_text(10, 60, "Welcome to ilo-lawa OS!", 0x00FF00, None);
-    gfx.draw_text(10, 80, "================================", 0x00FF00, None);
+    crate::terminal::print("Kernel is running without interrupts.\n");
+    crate::terminal::print("This is a test to verify basic functionality.\n\n");
     
-    // System status
-    gfx.draw_text(10, 110, "System Status:", 0xFFFF00, None);
-    gfx.draw_text(10, 130, "[OK] UEFI ExitBootServices completed", 0x00FF00, None);
-    gfx.draw_text(10, 150, "[OK] Framebuffer initialized", 0x00FF00, None);
-    gfx.draw_text(10, 170, "[OK] Font rendering system active", 0x00FF00, None);
-    gfx.draw_text(10, 190, "[OK] Running in kernel mode", 0x00FF00, None);
-    
-    // Test different characters
-    gfx.draw_text(10, 230, "Character Test:", 0xFFFF00, None);
-    gfx.draw_text(10, 250, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 0xFFFFFF, None);
-    gfx.draw_text(10, 270, "abcdefghijklmnopqrstuvwxyz", 0xFFFFFF, None);
-    gfx.draw_text(10, 290, "0123456789 !@#$%^&*()_+-=", 0xFFFFFF, None);
-    gfx.draw_text(10, 310, "[]{}\\|;:'\",.<>/?`~", 0xFFFFFF, None);
-    
-    // Footer
-    gfx.draw_text(10, 350, "Press any key to continue... (not implemented yet)", 0x808080, None);
-    
-    // Halt the CPU
-    halt_loop();
+    // Simple test loop
+    let mut counter = 0u32;
+    loop {
+        if counter % 100000000 == 0 {
+            crate::terminal::print(".");
+        }
+        counter = counter.wrapping_add(1);
+        
+        // Don't use hlt without interrupts - it would hang forever
+        // Just busy loop instead
+    }
 }
 
 pub fn halt_loop() -> ! {

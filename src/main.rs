@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
 
@@ -9,6 +10,12 @@ use log::info;
 
 mod font;
 mod kernel;
+mod gdt;
+mod interrupts;
+mod pic;
+mod keyboard;
+mod terminal;
+
 use kernel::{FramebufferInfo, kernel_main};
 
 #[entry]
