@@ -1,0 +1,29 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# UEFI build artifacts
+/esp/
+/ovmf/
+*.efi
+
+# Nix
+/result
+/result-*
+/.direnv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Build directories
+/build/
+/dist/
