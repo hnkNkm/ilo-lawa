@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use core::arch::asm;
+use crate::font::get_char_bitmap;
 
 // Framebuffer information that survives ExitBootServices
 #[derive(Clone, Copy)]
@@ -50,12 +51,37 @@ impl KernelGraphics {
         }
     }
     
-    pub fn draw_text(&self, x: usize, y: usize, text: &str, color: u32) {
-        // Simple 8x8 block characters for now
+    pub fn draw_char(&self, x: usize, y: usize, ch: char, color: u32, bg_color: Option<u32>) {
+        let bitmap = get_char_bitmap(ch);
+        
+        for (row_idx, &row_data) in bitmap.iter().enumerate() {
+            for bit in 0..8 {
+                let pixel_x = x + bit;
+                let pixel_y = y + row_idx;
+                
+                if pixel_x >= self.fb_info.width || pixel_y >= self.fb_info.height {
+                    continue;
+                }
+                
+                // Check if bit is set (pixel should be drawn)
+                // Font data uses bit 0 as leftmost pixel, so use (1 << bit)
+                if row_data & (1 << bit) != 0 {
+                    self.draw_pixel(pixel_x, pixel_y, color);
+                } else if let Some(bg) = bg_color {
+                    self.draw_pixel(pixel_x, pixel_y, bg);
+                }
+            }
+        }
+    }
+    
+    pub fn draw_text(&self, x: usize, y: usize, text: &str, color: u32, bg_color: Option<u32>) {
         let mut cx = x;
-        for _ch in text.chars() {
-            self.draw_rect(cx, y, 6, 8, color);
-            cx += 8;
+        for ch in text.chars() {
+            if ch == '\n' {
+                return; // Simple newline handling
+            }
+            self.draw_char(cx, y, ch, color, bg_color);
+            cx += 8; // Move to next character position (8 pixels)
         }
     }
 }
@@ -65,22 +91,33 @@ pub fn kernel_main(fb_info: FramebufferInfo) -> ! {
     // We are now running without UEFI!
     let gfx = KernelGraphics::new(fb_info);
     
-    // Clear screen to dark blue
-    gfx.clear(0x001122);
+    // Clear screen to dark background
+    gfx.clear(0x0A0A0A);
     
-    // Draw UI
-    gfx.draw_rect(0, 0, fb_info.width, 30, 0x003366);  // Title bar
-    gfx.draw_text(10, 10, "ilo-lawa Kernel - Running independently!", 0xFFFFFF);
+    // Draw title bar
+    gfx.draw_rect(0, 0, fb_info.width, 40, 0x1A1A2E);
+    gfx.draw_text(10, 10, "ilo-lawa OS v0.2.0 - Independent Kernel Mode", 0xFFFFFF, None);
     
-    // Draw some shapes to show we're working
-    gfx.draw_rect(50, 100, 200, 150, 0x884422);   // Brown
-    gfx.draw_rect(300, 100, 200, 150, 0x228844);  // Green
-    gfx.draw_rect(550, 100, 200, 150, 0x224488);  // Blue
+    // Draw welcome message with proper font rendering
+    gfx.draw_text(10, 60, "Welcome to ilo-lawa OS!", 0x00FF00, None);
+    gfx.draw_text(10, 80, "================================", 0x00FF00, None);
     
-    // Status message
-    gfx.draw_text(50, 300, "UEFI ExitBootServices completed successfully", 0x00FF00);
-    gfx.draw_text(50, 320, "Kernel is running independently", 0x00FF00);
-    gfx.draw_text(50, 340, "No UEFI services available", 0xFFFF00);
+    // System status
+    gfx.draw_text(10, 110, "System Status:", 0xFFFF00, None);
+    gfx.draw_text(10, 130, "[OK] UEFI ExitBootServices completed", 0x00FF00, None);
+    gfx.draw_text(10, 150, "[OK] Framebuffer initialized", 0x00FF00, None);
+    gfx.draw_text(10, 170, "[OK] Font rendering system active", 0x00FF00, None);
+    gfx.draw_text(10, 190, "[OK] Running in kernel mode", 0x00FF00, None);
+    
+    // Test different characters
+    gfx.draw_text(10, 230, "Character Test:", 0xFFFF00, None);
+    gfx.draw_text(10, 250, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 0xFFFFFF, None);
+    gfx.draw_text(10, 270, "abcdefghijklmnopqrstuvwxyz", 0xFFFFFF, None);
+    gfx.draw_text(10, 290, "0123456789 !@#$%^&*()_+-=", 0xFFFFFF, None);
+    gfx.draw_text(10, 310, "[]{}\\|;:'\",.<>/?`~", 0xFFFFFF, None);
+    
+    // Footer
+    gfx.draw_text(10, 350, "Press any key to continue... (not implemented yet)", 0x808080, None);
     
     // Halt the CPU
     halt_loop();

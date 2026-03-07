@@ -7,6 +7,7 @@ use uefi::prelude::*;
 use uefi::proto::console::gop::GraphicsOutput;
 use log::info;
 
+mod font;
 mod kernel;
 use kernel::{FramebufferInfo, kernel_main};
 
