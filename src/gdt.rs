@@ -9,7 +9,7 @@ lazy_static! {
     static ref TSS: TaskStateSegment = {
         let mut tss = TaskStateSegment::new();
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-            const STACK_SIZE: usize = 4096 * 5;
+            const STACK_SIZE: usize = 4096 * 16; // 64KB stack for double fault
             static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
             
             let stack_start = VirtAddr::from_ptr(&raw const STACK);
@@ -24,13 +24,15 @@ lazy_static! {
     static ref GDT: (GlobalDescriptorTable, Selectors) = {
         let mut gdt = GlobalDescriptorTable::new();
         let code_selector = gdt.add_entry(Descriptor::kernel_code_segment());
+        let data_selector = gdt.add_entry(Descriptor::kernel_data_segment());
         let tss_selector = gdt.add_entry(Descriptor::tss_segment(&TSS));
-        (gdt, Selectors { code_selector, tss_selector })
+        (gdt, Selectors { code_selector, data_selector, tss_selector })
     };
 }
 
 struct Selectors {
     code_selector: SegmentSelector,
+    data_selector: SegmentSelector,
     tss_selector: SegmentSelector,
 }
 
@@ -44,11 +46,12 @@ pub fn init() {
         CS::set_reg(GDT.1.code_selector);
         // Load TSS
         load_tss(GDT.1.tss_selector);
-        // Set other segments to null (0)
-        DS::set_reg(SegmentSelector::new(0, x86_64::PrivilegeLevel::Ring0));
-        ES::set_reg(SegmentSelector::new(0, x86_64::PrivilegeLevel::Ring0));
+        // Set data segments to kernel data segment
+        DS::set_reg(GDT.1.data_selector);
+        ES::set_reg(GDT.1.data_selector);
+        SS::set_reg(GDT.1.data_selector);
+        // FS and GS can remain null for now
         FS::set_reg(SegmentSelector::new(0, x86_64::PrivilegeLevel::Ring0));
         GS::set_reg(SegmentSelector::new(0, x86_64::PrivilegeLevel::Ring0));
-        SS::set_reg(SegmentSelector::new(0, x86_64::PrivilegeLevel::Ring0));
     }
 }

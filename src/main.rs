@@ -15,6 +15,7 @@ mod interrupts;
 mod pic;
 mod keyboard;
 mod terminal;
+mod cpu;
 
 use kernel::{FramebufferInfo, kernel_main};
 

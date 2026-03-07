@@ -100,6 +100,11 @@ pub fn kernel_main(fb_info: FramebufferInfo) -> ! {
     crate::terminal::print("System Initialization:\n");
     crate::terminal::print("[OK] Interrupts disabled\n");
     
+    // Initialize CPU features (FPU, SSE)
+    crate::terminal::print("Initializing CPU features...");
+    crate::cpu::init();
+    crate::terminal::print(" [OK]\n");
+    
     // Initialize GDT
     crate::terminal::print("Initializing GDT...");
     crate::gdt::init();
