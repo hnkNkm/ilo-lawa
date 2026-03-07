@@ -88,6 +88,9 @@ impl KernelGraphics {
 
 // The actual kernel entry point after ExitBootServices
 pub fn kernel_main(fb_info: FramebufferInfo) -> ! {
+    // CRITICAL: Disable interrupts immediately after ExitBootServices
+    x86_64::instructions::interrupts::disable();
+    
     // Initialize terminal first
     crate::terminal::init(fb_info);
     
@@ -95,24 +98,36 @@ pub fn kernel_main(fb_info: FramebufferInfo) -> ! {
     crate::terminal::print("ilo-lawa OS v0.3.0\n");
     crate::terminal::print("===================\n\n");
     crate::terminal::print("System Initialization:\n");
+    crate::terminal::print("[OK] Interrupts disabled\n");
     
-    // TEMPORARY: Skip interrupt system for now
-    crate::terminal::print("[SKIP] Interrupt system disabled for debugging\n");
-    crate::terminal::print("[OK] Terminal initialized\n\n");
+    // Initialize GDT
+    crate::terminal::print("Initializing GDT...");
+    crate::gdt::init();
+    crate::terminal::print(" [OK]\n");
     
-    crate::terminal::print("Kernel is running without interrupts.\n");
-    crate::terminal::print("This is a test to verify basic functionality.\n\n");
+    // Initialize IDT
+    crate::terminal::print("Initializing IDT...");
+    crate::interrupts::init();
+    crate::terminal::print(" [OK]\n");
     
-    // Simple test loop
-    let mut counter = 0u32;
+    // Initialize PIC
+    crate::terminal::print("Initializing PIC...");
+    unsafe { crate::pic::PICS.lock().initialize() };
+    crate::terminal::print(" [OK]\n");
+    
+    crate::terminal::print("\nInterrupt system ready.\n");
+    crate::terminal::print("Enabling interrupts...");
+    
+    // Enable interrupts
+    x86_64::instructions::interrupts::enable();
+    crate::terminal::print(" [OK]\n\n");
+    
+    crate::terminal::print("Type on the keyboard (interrupt mode):\n");
+    crate::terminal::print("> ");
+    
+    // Main kernel loop
     loop {
-        if counter % 100000000 == 0 {
-            crate::terminal::print(".");
-        }
-        counter = counter.wrapping_add(1);
-        
-        // Don't use hlt without interrupts - it would hang forever
-        // Just busy loop instead
+        x86_64::instructions::hlt();
     }
 }
 

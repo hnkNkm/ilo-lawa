@@ -47,15 +47,6 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
     
-    // Debug: Show raw scancode
-    crate::terminal::print("[");
-    let hex_chars = "0123456789ABCDEF";
-    let high = ((scancode >> 4) & 0xF) as usize;
-    let low = (scancode & 0xF) as usize;
-    crate::terminal::print(&hex_chars[high..high+1]);
-    crate::terminal::print(&hex_chars[low..low+1]);
-    crate::terminal::print("] ");
-    
     // Process the scan code
     crate::keyboard::add_scancode(scancode);
     
