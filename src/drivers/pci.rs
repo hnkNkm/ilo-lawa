@@ -1,7 +1,7 @@
 // PCI and VirtIO device detection
 
 use crate::drivers::virtio;
-use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
+use x86_64::instructions::port::{Port, PortReadOnly};
 
 // QEMU virtio-mmio device addresses for x86_64
 // These are standard addresses used by QEMU when virtio-mmio devices are specified
@@ -130,6 +130,21 @@ unsafe fn pci_config_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> 
     data_port.read()
 }
 
+/// Write PCI configuration space
+unsafe fn pci_config_write_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    let address = (1u32 << 31) // Enable bit
+        | ((bus as u32) << 16)
+        | ((device as u32) << 11)
+        | ((function as u32) << 8)
+        | ((offset as u32) & 0xFC);
+    
+    let mut addr_port = Port::<u32>::new(PCI_CONFIG_ADDRESS);
+    let mut data_port = Port::<u32>::new(PCI_CONFIG_DATA);
+    
+    addr_port.write(address);
+    data_port.write(value);
+}
+
 /// Probe for PCI VirtIO devices
 pub unsafe fn probe_virtio_pci_devices() -> Result<(), &'static str> {
     crate::terminal::print("Scanning PCI bus for VirtIO devices...\n");
@@ -166,10 +181,23 @@ pub unsafe fn probe_virtio_pci_devices() -> Result<(), &'static str> {
                             print_hex(addr);
                             crate::terminal::print("\n");
                             
-                            // Try to initialize the device
-                            // Note: This address needs to be mapped properly
-                            // For now, we'll just report it
-                            crate::terminal::print("  Note: PCI device found but initialization not yet implemented\n");
+                            // Enable bus mastering and memory space
+                            let command = pci_config_read_u32(bus, device, 0, 0x04);
+                            let new_command = command | 0x06; // Enable memory space and bus mastering
+                            pci_config_write_u32(bus, device, 0, 0x04, new_command);
+                            
+                            // Try to initialize the VirtIO block device
+                            crate::terminal::print("  Initializing VirtIO block device...\n");
+                            match virtio::init_virtio_block(addr) {
+                                Ok(_) => {
+                                    crate::terminal::print("  VirtIO block device initialized successfully!\n");
+                                }
+                                Err(e) => {
+                                    crate::terminal::print("  Failed to initialize: ");
+                                    crate::terminal::print(e);
+                                    crate::terminal::print("\n");
+                                }
+                            }
                         }
                         
                         return Ok(());

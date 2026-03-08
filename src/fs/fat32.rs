@@ -191,9 +191,62 @@ impl Fat32FileSystem {
 }
 
 impl FSTrait for Fat32FileSystem {
-    fn read_file(&mut self, _path: &str) -> Result<Vec<u8>, FileSystemError> {
-        // Simplified: read a file from current directory
-        Err(FileSystemError::NotImplemented)
+    fn read_file(&mut self, path: &str) -> Result<Vec<u8>, FileSystemError> {
+        // Get filename from path
+        let filename = path.split('/').last().unwrap_or(path);
+        
+        // Read directory entries from current cluster
+        let cluster_data = self.read_cluster(self.current_dir_cluster);
+        
+        // Find the file entry
+        for i in 0..(cluster_data.len() / 32) {
+            let entry_bytes = &cluster_data[i * 32..(i + 1) * 32];
+            
+            if let Some(entry) = self.parse_dir_entry(entry_bytes) {
+                // Skip directories and special entries
+                if entry.attributes & (ATTR_DIRECTORY | ATTR_VOLUME_ID) != 0 {
+                    continue;
+                }
+                
+                // Compare filename (8.3 format)
+                let mut entry_name = String::new();
+                for &b in &entry.name[..8] {
+                    if b != 0x20 {
+                        entry_name.push(b as char);
+                    }
+                }
+                if entry.name[8] != 0x20 {
+                    entry_name.push('.');
+                    for &b in &entry.name[8..11] {
+                        if b != 0x20 {
+                            entry_name.push(b as char);
+                        }
+                    }
+                }
+                
+                // Check if this is our file
+                if entry_name.to_lowercase() == filename.to_lowercase() {
+                    // Get first cluster
+                    let first_cluster = ((entry.first_cluster_high as u32) << 16) | entry.first_cluster_low as u32;
+                    
+                    // Read file data following cluster chain
+                    let mut file_data = Vec::new();
+                    let mut current = first_cluster;
+                    
+                    while current >= 2 && current < FAT32_EOC {
+                        let cluster_content = self.read_cluster(current);
+                        file_data.extend_from_slice(&cluster_content);
+                        current = self.get_fat_entry(current);
+                    }
+                    
+                    // Truncate to actual file size
+                    file_data.truncate(entry.file_size as usize);
+                    return Ok(file_data);
+                }
+            }
+        }
+        
+        Err(FileSystemError::NotFound)
     }
     
     fn write_file(&mut self, _path: &str, _data: &[u8]) -> Result<(), FileSystemError> {
