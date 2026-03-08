@@ -111,6 +111,12 @@ impl Terminal {
             self.write_char(c);
         }
     }
+    
+    pub fn clear_screen(&mut self) {
+        self.gfx.clear(self.bg_color);
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+    }
 }
 
 pub fn init(fb_info: FramebufferInfo) {
@@ -127,5 +133,11 @@ pub fn print_char(c: char) {
 pub fn print(s: &str) {
     if let Some(ref mut terminal) = *TERMINAL.lock() {
         terminal.write_string(s);
+    }
+}
+
+pub fn clear() {
+    if let Some(ref mut terminal) = *TERMINAL.lock() {
+        terminal.clear_screen();
     }
 }

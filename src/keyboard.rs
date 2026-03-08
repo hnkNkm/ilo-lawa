@@ -153,7 +153,7 @@ impl Keyboard {
 pub fn add_scancode(scancode: u8) {
     let mut keyboard = KEYBOARD.lock();
     if let Some(c) = keyboard.process_scancode(scancode) {
-        // Handle the character (pass to terminal or buffer)
-        crate::terminal::print_char(c);
+        // Pass character to shell
+        crate::shell::handle_input(c);
     }
 }

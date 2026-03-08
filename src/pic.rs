@@ -1,6 +1,9 @@
 use x86_64::instructions::port::Port;
 use spin::Mutex;
 
+// Global tick counter for uptime tracking
+pub static mut TICKS: u64 = 0;
+
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 

@@ -95,10 +95,15 @@ pub fn kernel_main(fb_info: FramebufferInfo) -> ! {
     crate::terminal::init(fb_info);
     
     // Clear screen and show boot messages
-    crate::terminal::print("ilo-lawa OS v0.3.0\n");
+    crate::terminal::print("ilo-lawa OS v0.4.0\n");
     crate::terminal::print("===================\n\n");
     crate::terminal::print("System Initialization:\n");
     crate::terminal::print("[OK] Interrupts disabled\n");
+    
+    // Initialize heap allocator
+    crate::terminal::print("Initializing heap allocator...");
+    crate::allocator::init_heap();
+    crate::terminal::print(" [OK]\n");
     
     // Initialize CPU features (FPU, SSE)
     crate::terminal::print("Initializing CPU features...");
@@ -125,10 +130,12 @@ pub fn kernel_main(fb_info: FramebufferInfo) -> ! {
     
     // Enable interrupts
     x86_64::instructions::interrupts::enable();
-    crate::terminal::print(" [OK]\n\n");
+    crate::terminal::print(" [OK]\n");
     
-    crate::terminal::print("Type on the keyboard (interrupt mode):\n");
-    crate::terminal::print("> ");
+    // Initialize shell
+    crate::terminal::print("Starting shell...");
+    crate::shell::init();
+    crate::terminal::print(" [OK]\n");
     
     // Main kernel loop
     loop {

@@ -1,12 +1,12 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![feature(alloc_error_handler)]
 
 extern crate alloc;
 
 use uefi::prelude::*;
 use uefi::proto::console::gop::GraphicsOutput;
-use log::info;
 
 mod font;
 mod kernel;
@@ -16,14 +16,14 @@ mod pic;
 mod keyboard;
 mod terminal;
 mod cpu;
+mod allocator;
+mod shell;
 
 use kernel::{FramebufferInfo, kernel_main};
+use core::panic::PanicInfo;
 
 #[entry]
-fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
-    uefi::helpers::init(&mut system_table).unwrap();
-    
-    info!("Preparing to exit boot services and enter kernel mode...");
+fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     
     // Display boot message
     system_table.stdout().clear().unwrap();
@@ -72,4 +72,24 @@ fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     // WE ARE NOW IN KERNEL MODE!
     // No more UEFI services, we're on our own
     kernel_main(fb_info);
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    // Try to print panic info if terminal is available
+    crate::terminal::print("\n\n!!! KERNEL PANIC !!!\n");
+    
+    if let Some(s) = info.payload().downcast_ref::<&str>() {
+        crate::terminal::print(s);
+    }
+    
+    if let Some(location) = info.location() {
+        crate::terminal::print("\nPanic occurred at: ");
+        crate::terminal::print(location.file());
+    }
+    
+    // Halt the system
+    loop {
+        x86_64::instructions::hlt();
+    }
 }

@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-uefi = "0.28"
-uefi-services = "0.25"
+uefi = { version = "0.28", default-features = false, features = ["alloc"] }
 log = "0.4"
 x86_64 = "0.14"
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
