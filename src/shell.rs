@@ -45,7 +45,16 @@ impl Shell {
                 if self.cursor_position > 0 && !self.command_buffer.is_empty() {
                     self.cursor_position -= 1;
                     self.command_buffer.remove(self.cursor_position);
-                    self.redraw_line();
+                    // Redraw the entire line to handle backspace properly
+                    crate::terminal::print("\r");
+                    // Clear the entire line
+                    for _ in 0..80 {  // Clear 80 characters
+                        crate::terminal::print_char(' ');
+                    }
+                    crate::terminal::print("\r");
+                    // Reprint prompt and command buffer
+                    self.print_prompt();
+                    crate::terminal::print(&self.command_buffer);
                 }
             }
             '\x7F' => { // Delete
@@ -106,18 +115,16 @@ impl Shell {
     }
     
     fn redraw_line(&self) {
-        // Move cursor to beginning of line
+        // Move cursor back and reprint the line
         crate::terminal::print("\r");
+        // Clear the line with spaces
+        for _ in 0..(10 + self.command_buffer.len()) {
+            crate::terminal::print_char(' ');
+        }
+        crate::terminal::print("\r");
+        // Reprint prompt and buffer
         self.print_prompt();
         crate::terminal::print(&self.command_buffer);
-        crate::terminal::print(" "); // Clear any remaining characters
-        crate::terminal::print("\r");
-        self.print_prompt();
-        
-        // Move cursor to correct position
-        for i in 0..self.cursor_position {
-            crate::terminal::print_char(self.command_buffer.chars().nth(i).unwrap_or(' '));
-        }
     }
     
     // Built-in commands

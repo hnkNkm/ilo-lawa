@@ -45,10 +45,14 @@ impl Terminal {
             '\n' => {
                 self.newline();
             }
-            '\x08' => { // Backspace
+            '\r' => { // Carriage return
+                self.cursor_x = 0;
+            }
+            '\x08' => { // Backspace - Terminal level handling (not used by shell)
                 if self.cursor_x > 0 {
                     self.cursor_x -= 1;
                     self.draw_char_at_cursor(' ');
+                    // Keep cursor at the backspaced position
                 }
             }
             '\t' => {
@@ -71,8 +75,8 @@ impl Terminal {
             }
         }
         
-        // Draw cursor
-        self.draw_cursor();
+        // Draw cursor (temporarily disabled for debugging)
+        // self.draw_cursor();
     }
     
     fn draw_char_at_cursor(&mut self, c: char) {
