@@ -18,6 +18,7 @@ mod terminal;
 mod cpu;
 mod allocator;
 mod shell;
+mod fs;
 
 use kernel::{FramebufferInfo, kernel_main};
 use core::panic::PanicInfo;

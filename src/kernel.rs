@@ -132,6 +132,11 @@ pub fn kernel_main(fb_info: FramebufferInfo) -> ! {
     x86_64::instructions::interrupts::enable();
     crate::terminal::print(" [OK]\n");
     
+    // Initialize filesystem
+    crate::terminal::print("Initializing filesystem...");
+    crate::fs::init();
+    crate::terminal::print(" [OK]\n");
+    
     // Initialize shell
     crate::terminal::print("Starting shell...");
     crate::shell::init();

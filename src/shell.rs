@@ -101,6 +101,14 @@ impl Shell {
             "history" => self.cmd_history(),
             "shutdown" => self.cmd_shutdown(),
             "reboot" => self.cmd_reboot(),
+            // Filesystem commands
+            "ls" => self.cmd_ls(),
+            "cd" => self.cmd_cd(if parts.len() > 1 { parts[1] } else { "/" }),
+            "pwd" => self.cmd_pwd(),
+            "cat" => self.cmd_cat(if parts.len() > 1 { parts[1] } else { "" }),
+            "mkdir" => self.cmd_mkdir(if parts.len() > 1 { parts[1] } else { "" }),
+            "rm" => self.cmd_rm(if parts.len() > 1 { parts[1] } else { "" }),
+            "write" => self.cmd_write(&parts[1..]),
             "" => {}, // Empty command
             _ => {
                 crate::terminal::print("Unknown command: ");
@@ -130,6 +138,7 @@ impl Shell {
     // Built-in commands
     fn cmd_help(&self) {
         crate::terminal::print("Available commands:\n");
+        crate::terminal::print("\nSystem Commands:\n");
         crate::terminal::print("  help     - Show this help message\n");
         crate::terminal::print("  clear    - Clear the screen\n");
         crate::terminal::print("  echo     - Print arguments to screen\n");
@@ -138,6 +147,14 @@ impl Shell {
         crate::terminal::print("  history  - Show command history\n");
         crate::terminal::print("  shutdown - Shutdown the system\n");
         crate::terminal::print("  reboot   - Reboot the system\n");
+        crate::terminal::print("\nFilesystem Commands:\n");
+        crate::terminal::print("  ls       - List directory contents\n");
+        crate::terminal::print("  cd       - Change directory\n");
+        crate::terminal::print("  pwd      - Print working directory\n");
+        crate::terminal::print("  cat      - Display file contents\n");
+        crate::terminal::print("  mkdir    - Create directory\n");
+        crate::terminal::print("  rm       - Remove file\n");
+        crate::terminal::print("  write    - Create file with content\n");
     }
     
     fn cmd_clear(&self) {
@@ -213,6 +230,117 @@ impl Shell {
         // If that doesn't work, just halt
         loop {
             x86_64::instructions::hlt();
+        }
+    }
+    
+    // Filesystem commands
+    fn cmd_ls(&self) {
+        let files = crate::fs::list_directory();
+        if files.is_empty() {
+            crate::terminal::print("(empty directory)\n");
+        } else {
+            for file in files {
+                crate::terminal::print(&file);
+                crate::terminal::print("\n");
+            }
+        }
+    }
+    
+    fn cmd_cd(&self, path: &str) {
+        match crate::fs::change_directory(path) {
+            Ok(_) => {},
+            Err(e) => {
+                crate::terminal::print("cd: ");
+                crate::terminal::print(&e);
+                crate::terminal::print("\n");
+            }
+        }
+    }
+    
+    fn cmd_pwd(&self) {
+        let path = crate::fs::get_current_path();
+        crate::terminal::print(&path);
+        crate::terminal::print("\n");
+    }
+    
+    fn cmd_cat(&self, filename: &str) {
+        if filename.is_empty() {
+            crate::terminal::print("Usage: cat <filename>\n");
+            return;
+        }
+        
+        match crate::fs::read_file(filename) {
+            Ok(data) => {
+                // Convert bytes to string for display
+                if let Ok(content) = String::from_utf8(data) {
+                    crate::terminal::print(&content);
+                    if !content.ends_with('\n') {
+                        crate::terminal::print("\n");
+                    }
+                } else {
+                    crate::terminal::print("(binary file)\n");
+                }
+            }
+            Err(e) => {
+                crate::terminal::print("cat: ");
+                crate::terminal::print(&e);
+                crate::terminal::print("\n");
+            }
+        }
+    }
+    
+    fn cmd_mkdir(&self, dirname: &str) {
+        if dirname.is_empty() {
+            crate::terminal::print("Usage: mkdir <dirname>\n");
+            return;
+        }
+        
+        match crate::fs::create_directory(dirname) {
+            Ok(_) => {},
+            Err(e) => {
+                crate::terminal::print("mkdir: ");
+                crate::terminal::print(&e);
+                crate::terminal::print("\n");
+            }
+        }
+    }
+    
+    fn cmd_rm(&self, filename: &str) {
+        if filename.is_empty() {
+            crate::terminal::print("Usage: rm <filename>\n");
+            return;
+        }
+        
+        match crate::fs::remove_file(filename) {
+            Ok(_) => {},
+            Err(e) => {
+                crate::terminal::print("rm: ");
+                crate::terminal::print(&e);
+                crate::terminal::print("\n");
+            }
+        }
+    }
+    
+    fn cmd_write(&self, args: &[&str]) {
+        if args.len() < 2 {
+            crate::terminal::print("Usage: write <filename> <content>\n");
+            return;
+        }
+        
+        let filename = args[0];
+        let content = args[1..].join(" ");
+        
+        match crate::fs::create_file(filename, content.into_bytes()) {
+            Ok(_) => {
+                crate::terminal::print("File created: ");
+                crate::terminal::print(filename);
+                crate::terminal::print("\n");
+            }
+            Err(e) => {
+                crate::terminal::print("write: ");
+                crate::terminal::print(&e);
+                crate::terminal::print("\n");
+            }
         }
     }
 }
