@@ -9,6 +9,9 @@ Cargo.lock
 /ovmf/
 *.efi
 
+# Disk images
+*.img
+
 # Nix
 /result
 /result-*

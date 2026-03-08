@@ -132,6 +132,24 @@ pub fn kernel_main(fb_info: FramebufferInfo) -> ! {
     x86_64::instructions::interrupts::enable();
     crate::terminal::print(" [OK]\n");
     
+    // Probe for storage devices
+    crate::terminal::print("Probing for storage devices...\n");
+    unsafe { 
+        // Try PCI devices first (standard for x86_64)
+        if let Err(e) = crate::drivers::pci::probe_virtio_pci_devices() {
+            crate::terminal::print("PCI: ");
+            crate::terminal::print(e);
+            crate::terminal::print("\n");
+            
+            // Fallback to MMIO devices
+            if let Err(e) = crate::drivers::pci::probe_virtio_mmio_devices() {
+                crate::terminal::print("MMIO: ");
+                crate::terminal::print(e);
+                crate::terminal::print("\n");
+            }
+        }
+    }
+    
     // Initialize filesystem
     crate::terminal::print("Initializing filesystem...");
     crate::fs::init();
