@@ -92,29 +92,51 @@ impl Shell {
             return;
         }
         
-        match parts[0] {
+        let cmd_name = parts[0];
+        let args = &parts[1..];
+        
+        match cmd_name {
             "help" => self.cmd_help(),
             "clear" => self.cmd_clear(),
-            "echo" => self.cmd_echo(&parts[1..]),
+            "echo" => self.cmd_echo(args),
             "version" => self.cmd_version(),
             "uptime" => self.cmd_uptime(),
             "history" => self.cmd_history(),
             "shutdown" => self.cmd_shutdown(),
             "reboot" => self.cmd_reboot(),
-            // Filesystem commands
-            "ls" => self.cmd_ls(),
-            "cd" => self.cmd_cd(if parts.len() > 1 { parts[1] } else { "/" }),
+            // Filesystem commands with unified argument handling
+            "ls" => self.cmd_ls(self.get_first_arg(args, "")),
+            "cd" => self.cmd_cd(self.get_first_arg(args, "/")),
             "pwd" => self.cmd_pwd(),
-            "cat" => self.cmd_cat(if parts.len() > 1 { parts[1] } else { "" }),
-            "mkdir" => self.cmd_mkdir(if parts.len() > 1 { parts[1] } else { "" }),
-            "rm" => self.cmd_rm(if parts.len() > 1 { parts[1] } else { "" }),
-            "write" => self.cmd_write(&parts[1..]),
+            "cat" => self.cmd_with_required_path("cat", args, Self::cmd_cat),
+            "mkdir" => self.cmd_with_required_path("mkdir", args, Self::cmd_mkdir),
+            "rm" => self.cmd_with_required_path("rm", args, Self::cmd_rm),
+            "write" => self.cmd_write(args),
             "" => {}, // Empty command
             _ => {
                 crate::terminal::print("Unknown command: ");
-                crate::terminal::print(parts[0]);
+                crate::terminal::print(cmd_name);
                 crate::terminal::print("\nType 'help' for available commands.\n");
             }
+        }
+    }
+    
+    // Helper methods for unified argument handling
+    fn get_first_arg<'a>(&self, args: &'a [&str], default: &'a str) -> &'a str {
+        if !args.is_empty() && !args[0].is_empty() {
+            args[0]
+        } else {
+            default
+        }
+    }
+    
+    fn cmd_with_required_path(&self, cmd_name: &str, args: &[&str], f: fn(&Self, &str)) {
+        if args.is_empty() || args[0].is_empty() {
+            crate::terminal::print("Usage: ");
+            crate::terminal::print(cmd_name);
+            crate::terminal::print(" <path>\n");
+        } else {
+            f(self, args[0]);
         }
     }
     
@@ -234,8 +256,8 @@ impl Shell {
     }
     
     // Filesystem commands
-    fn cmd_ls(&self) {
-        let files = crate::fs::list_directory();
+    fn cmd_ls(&self, path: &str) {
+        let files = crate::fs::list_directory(path);
         if files.is_empty() {
             crate::terminal::print("(empty directory)\n");
         } else {

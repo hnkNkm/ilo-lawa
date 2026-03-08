@@ -68,8 +68,9 @@ pub fn init() {
     let _ = FILESYSTEM.lock();
 }
 
-pub fn list_directory() -> Vec<String> {
-    match FILESYSTEM.lock().list_directory(".") {
+pub fn list_directory(path: &str) -> Vec<String> {
+    let path_to_list = if path.is_empty() { "." } else { path };
+    match FILESYSTEM.lock().list_directory(path_to_list) {
         Ok(entries) => {
             entries.iter().map(|e| {
                 let type_char = if e.is_directory { "d" } else { "-" };
