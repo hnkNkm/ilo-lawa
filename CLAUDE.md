@@ -29,7 +29,7 @@ nix develop --impure
 Notes:
 - `.cargo/config.toml` sets the default target to `x86_64-unknown-uefi` and enables `build-std` for `core`, `compiler_builtins`, and `alloc` — plain `cargo build` works inside the Nix shell without extra flags.
 - `make run` copies the `.efi` to `esp/efi/boot/bootx64.efi` and boots QEMU with OVMF firmware (auto-downloaded to `ovmf/` on first run).
-- There are no automated tests; verification is done by booting in QEMU and exercising the shell.
+- There are no automated tests; verification is done by booting in QEMU and exercising the shell. The console is mirrored to COM1, so the serial output (`-serial stdio` in the Makefile, or `-serial file:...` headless) contains the full boot log and shell session as plain text.
 - Requires nightly Rust (provided by the Nix flake) for `#![feature(abi_x86_interrupt)]` and `#![feature(alloc_error_handler)]`.
 
 ## Architecture Overview
@@ -56,6 +56,7 @@ Notes:
 - `fat32.rs` exists (boot sector / dir entry structs) but is not wired in yet.
 
 **Shell & I/O**:
+- `src/serial.rs`: Polled 16550 COM1 driver. ALL terminal output is mirrored to serial (serial lock taken before, never nested with, the terminal lock), so QEMU's `-serial stdio`/`-serial file:` captures the boot log and entire shell session — the primary debugging channel. Thread context + panic path only; never from ISRs.
 - `src/shell.rs`: Command parsing, history (10 entries), built-ins (help, echo, version, reboot, ...) and filesystem commands (ls, cd, pwd, cat, mkdir, rm, write). Global singleton behind `spin::Mutex` — command handlers run in the kernel main loop (thread context), fed one character at a time from the scancode queue.
 - `src/terminal.rs`: Framebuffer text terminal (8x8 font from `src/font.rs`, direct pixel writes). "Scrolling" currently just clears the screen.
 - `src/keyboard.rs`: Scancode set 1 → ASCII, tracks Shift/Ctrl state.
