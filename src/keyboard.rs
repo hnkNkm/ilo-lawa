@@ -1,14 +1,53 @@
 use spin::Mutex;
 use lazy_static::lazy_static;
 
+const QUEUE_SIZE: usize = 256;
+
+// Scancodes are pushed here by the keyboard ISR and drained by the main
+// loop. This is the ONLY lock shared between interrupt and thread context;
+// the main loop must hold it with interrupts disabled.
+struct ScancodeQueue {
+    buffer: [u8; QUEUE_SIZE],
+    read_pos: usize,
+    write_pos: usize,
+}
+
+impl ScancodeQueue {
+    const fn new() -> Self {
+        ScancodeQueue {
+            buffer: [0; QUEUE_SIZE],
+            read_pos: 0,
+            write_pos: 0,
+        }
+    }
+
+    fn push(&mut self, scancode: u8) {
+        let next = (self.write_pos + 1) % QUEUE_SIZE;
+        if next != self.read_pos {
+            self.buffer[self.write_pos] = scancode;
+            self.write_pos = next;
+        }
+        // Queue full: drop the scancode rather than block in the ISR
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.read_pos == self.write_pos {
+            None
+        } else {
+            let scancode = self.buffer[self.read_pos];
+            self.read_pos = (self.read_pos + 1) % QUEUE_SIZE;
+            Some(scancode)
+        }
+    }
+}
+
+static SCANCODE_QUEUE: Mutex<ScancodeQueue> = Mutex::new(ScancodeQueue::new());
+
 lazy_static! {
     static ref KEYBOARD: Mutex<Keyboard> = Mutex::new(Keyboard::new());
 }
 
 pub struct Keyboard {
-    buffer: [u8; 256],
-    read_pos: usize,
-    write_pos: usize,
     shift_pressed: bool,
     ctrl_pressed: bool,
 }
@@ -16,9 +55,6 @@ pub struct Keyboard {
 impl Keyboard {
     pub fn new() -> Self {
         Keyboard {
-            buffer: [0; 256],
-            read_pos: 0,
-            write_pos: 0,
             shift_pressed: false,
             ctrl_pressed: false,
         }
@@ -150,10 +186,22 @@ impl Keyboard {
     }
 }
 
+/// Called from the keyboard interrupt handler: enqueue only, no decoding.
 pub fn add_scancode(scancode: u8) {
-    let mut keyboard = KEYBOARD.lock();
-    if let Some(c) = keyboard.process_scancode(scancode) {
-        // Pass character to shell
+    SCANCODE_QUEUE.lock().push(scancode);
+}
+
+/// Called from the main loop. The caller must have interrupts disabled,
+/// because the keyboard ISR takes the same queue lock.
+pub fn try_pop_scancode() -> Option<u8> {
+    SCANCODE_QUEUE.lock().pop()
+}
+
+/// Decode a scancode and feed the resulting character to the shell.
+/// Runs in normal thread context, never inside an ISR.
+pub fn handle_scancode(scancode: u8) {
+    let c = KEYBOARD.lock().process_scancode(scancode);
+    if let Some(c) = c {
         crate::shell::handle_input(c);
     }
 }

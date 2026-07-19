@@ -124,27 +124,36 @@ pub fn kernel_main(fb_info: FramebufferInfo) -> ! {
     crate::terminal::print("Initializing PIC...");
     unsafe { crate::pic::PICS.lock().initialize() };
     crate::terminal::print(" [OK]\n");
-    
-    crate::terminal::print("\nInterrupt system ready.\n");
-    crate::terminal::print("Enabling interrupts...");
-    
-    // Enable interrupts
-    x86_64::instructions::interrupts::enable();
-    crate::terminal::print(" [OK]\n");
-    
-    // Initialize filesystem
+
+    // Initialize filesystem BEFORE enabling interrupts: its allocations
+    // take locks that must never be held when an IRQ can arrive mid-init
     crate::terminal::print("Initializing filesystem...");
     crate::fs::init();
     crate::terminal::print(" [OK]\n");
-    
-    // Initialize shell
-    crate::terminal::print("Starting shell...");
-    crate::shell::init();
+
+    crate::terminal::print("\nInterrupt system ready.\n");
+    crate::terminal::print("Enabling interrupts...");
+
+    // Enable interrupts. The keyboard ISR only enqueues scancodes, so any
+    // key pressed from here on is buffered until the main loop drains it.
+    x86_64::instructions::interrupts::enable();
     crate::terminal::print(" [OK]\n");
-    
-    // Main kernel loop
+
+    // Initialize shell
+    crate::shell::init();
+
+    // Main kernel loop: drain the scancode queue in thread context.
+    // The queue lock is shared with the keyboard ISR, so it may only be
+    // taken with interrupts disabled; enable_and_hlt (sti; hlt) closes
+    // the window where a scancode could arrive between check and halt.
     loop {
-        x86_64::instructions::hlt();
+        x86_64::instructions::interrupts::disable();
+        if let Some(scancode) = crate::keyboard::try_pop_scancode() {
+            x86_64::instructions::interrupts::enable();
+            crate::keyboard::handle_scancode(scancode);
+        } else {
+            x86_64::instructions::interrupts::enable_and_hlt();
+        }
     }
 }
 
