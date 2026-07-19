@@ -90,7 +90,11 @@ impl KernelGraphics {
 pub fn kernel_main(fb_info: FramebufferInfo) -> ! {
     // CRITICAL: Disable interrupts immediately after ExitBootServices
     x86_64::instructions::interrupts::disable();
-    
+
+    // Bring up COM1 first so boot output reaches the host even before
+    // the framebuffer terminal exists
+    crate::serial::init();
+
     // Initialize terminal first
     crate::terminal::init(fb_info);
     

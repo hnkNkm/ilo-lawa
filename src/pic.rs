@@ -13,6 +13,7 @@ pub static PICS: Mutex<ChainedPics> = Mutex::new(unsafe {
 
 const CMD_INIT: u8 = 0x11;
 const CMD_END_OF_INTERRUPT: u8 = 0x20;
+const CMD_READ_ISR: u8 = 0x0B;
 const MODE_8086: u8 = 0x01;
 
 struct Pic {
@@ -99,6 +100,22 @@ impl ChainedPics {
         if interrupt_id >= self.pics[1].offset {
             self.pics[1].end_of_interrupt();
         }
+        self.pics[0].end_of_interrupt();
+    }
+
+    // OCW3 0x0B selects the In-Service Register; the next command-port read
+    // returns it. Master ISR is the low byte, slave ISR the high byte.
+    pub unsafe fn read_isr(&mut self) -> u16 {
+        self.pics[0].command.write(CMD_READ_ISR);
+        self.pics[1].command.write(CMD_READ_ISR);
+        let master = self.pics[0].command.read() as u16;
+        let slave = self.pics[1].command.read() as u16;
+        (slave << 8) | master
+    }
+
+    // For spurious IRQ15: the slave has nothing in service, but the master's
+    // cascade line (IRQ2) genuinely was, so only the master needs an EOI.
+    pub unsafe fn notify_end_of_interrupt_master(&mut self) {
         self.pics[0].end_of_interrupt();
     }
     

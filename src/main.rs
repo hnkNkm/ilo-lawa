@@ -15,6 +15,7 @@ mod interrupts;
 mod pic;
 mod keyboard;
 mod terminal;
+mod serial;
 mod cpu;
 mod allocator;
 mod shell;
@@ -84,6 +85,7 @@ fn panic(info: &PanicInfo) -> ! {
     // The panic may have interrupted code that held the terminal lock;
     // that context will never resume, so break the lock before printing
     unsafe { crate::terminal::force_unlock() };
+    unsafe { crate::serial::force_unlock() };
 
     crate::terminal::print("\n\n!!! KERNEL PANIC !!!\n");
 
