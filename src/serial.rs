@@ -87,6 +87,15 @@ pub fn print_fmt(args: core::fmt::Arguments) {
     let _ = SERIAL1.lock().write_fmt(args);
 }
 
+/// Best-effort print for exception context: the faulting code may already
+/// hold the lock, so skip output instead of spinning forever.
+pub fn try_print(s: &str) {
+    use core::fmt::Write;
+    if let Some(mut port) = SERIAL1.try_lock() {
+        let _ = port.write_str(s);
+    }
+}
+
 /// Recover the serial lock on the panic path: the interrupted context may
 /// still hold it and will never resume. Only safe to call with interrupts
 /// disabled and when the lock holder cannot run again.
