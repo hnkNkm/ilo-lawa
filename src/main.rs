@@ -77,18 +77,27 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Try to print panic info if terminal is available
+    // A panicked kernel must not keep servicing IRQs (the shell would
+    // continue running over corrupted state)
+    x86_64::instructions::interrupts::disable();
+
+    // The panic may have interrupted code that held the terminal lock;
+    // that context will never resume, so break the lock before printing
+    unsafe { crate::terminal::force_unlock() };
+
     crate::terminal::print("\n\n!!! KERNEL PANIC !!!\n");
-    
-    if let Some(s) = info.payload().downcast_ref::<&str>() {
-        crate::terminal::print(s);
-    }
-    
+
     if let Some(location) = info.location() {
-        crate::terminal::print("\nPanic occurred at: ");
-        crate::terminal::print(location.file());
+        crate::terminal::print_fmt(format_args!(
+            "at {}:{}:{}\n",
+            location.file(),
+            location.line(),
+            location.column()
+        ));
     }
-    
+
+    crate::terminal::print_fmt(format_args!("{}\n", info.message()));
+
     // Halt the system
     loop {
         x86_64::instructions::hlt();

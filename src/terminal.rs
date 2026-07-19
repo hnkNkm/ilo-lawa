@@ -123,9 +123,30 @@ impl Terminal {
     }
 }
 
+impl core::fmt::Write for Terminal {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.write_string(s);
+        Ok(())
+    }
+}
+
 pub fn init(fb_info: FramebufferInfo) {
     let terminal = Terminal::new(fb_info);
     *TERMINAL.lock() = Some(terminal);
+}
+
+pub fn print_fmt(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+    if let Some(ref mut terminal) = *TERMINAL.lock() {
+        let _ = terminal.write_fmt(args);
+    }
+}
+
+/// Recover the terminal lock on the panic path: the interrupted context may
+/// still hold it and will never resume. Only safe to call with interrupts
+/// disabled and when the lock holder cannot run again.
+pub unsafe fn force_unlock() {
+    TERMINAL.force_unlock();
 }
 
 pub fn print_char(c: char) {
