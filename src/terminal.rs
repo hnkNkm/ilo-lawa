@@ -111,7 +111,13 @@ impl Terminal {
         start_y: usize,
         previous_cells: usize,
     ) {
-        let start_y = start_y.min(self.rows.saturating_sub(1));
+        // Degenerate framebuffer (zero-width or zero-height GOP mode):
+        // there is nothing to draw and the cursor row/col math below
+        // would divide by zero, so do nothing.
+        if self.cols == 0 || self.rows == 0 {
+            return;
+        }
+        let start_y = start_y.min(self.rows - 1);
         let cells = previous_cells.max(prompt.len() + buffer.len());
 
         // Clear whatever the previous render left on those cells.
