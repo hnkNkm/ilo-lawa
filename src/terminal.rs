@@ -90,17 +90,20 @@ impl Terminal {
         self.cursor_y += 1;
         
         if self.cursor_y >= self.rows {
+            if self.rows == 0 {
+                // Display shorter than one text row: nothing to scroll into.
+                self.cursor_y = 0;
+                return;
+            }
             self.scroll();
             self.cursor_y = self.rows - 1;
         }
     }
     
     fn scroll(&mut self) {
-        // For now, just clear the screen when we need to scroll
-        // TODO: Implement proper scrolling by copying framebuffer memory
-        self.gfx.clear(self.bg_color);
-        self.cursor_x = 0;
-        self.cursor_y = 0;
+        // Shift the framebuffer up by one text row and clear only the newly
+        // exposed bottom row, keeping earlier output readable.
+        self.gfx.scroll_up(CHAR_HEIGHT + LINE_SPACING, self.bg_color);
     }
     
     fn draw_cursor(&mut self) {
