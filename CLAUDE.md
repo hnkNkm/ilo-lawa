@@ -58,7 +58,7 @@ Notes:
 **Shell & I/O**:
 - `src/serial.rs`: Polled 16550 COM1 driver. ALL terminal output is mirrored to serial (serial lock taken before, never nested with, the terminal lock), so QEMU's `-serial stdio`/`-serial file:` captures the boot log and entire shell session — the primary debugging channel. Thread context + panic path only; never from ISRs.
 - `src/shell.rs`: Command parsing, history (10 entries), built-ins (help, echo, version, reboot, ...) and filesystem commands (ls, cd, pwd, cat, mkdir, rm, write). Global singleton behind `spin::Mutex` — command handlers run in the kernel main loop (thread context), fed one character at a time from the scancode queue.
-- `src/terminal.rs`: Framebuffer text terminal (8x8 font from `src/font.rs`, direct pixel writes). "Scrolling" currently just clears the screen.
+- `src/terminal.rs`: Framebuffer text terminal (8x8 font from `src/font.rs`, direct pixel writes). Scrolling shifts the framebuffer up one text row (10 px) via `KernelGraphics::scroll_up` memmove and clears only the exposed bottom row.
 - `src/keyboard.rs`: Scancode set 1 → ASCII, tracks Shift/Ctrl state.
 
 ### Module Dependencies & Conventions
