@@ -28,6 +28,28 @@ impl From<&str> for FileSystemError {
     }
 }
 
+impl core::fmt::Display for FileSystemError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            FileSystemError::NotFound => write!(f, "No such file or directory"),
+            FileSystemError::PermissionDenied => write!(f, "Permission denied"),
+            FileSystemError::DiskFull => write!(f, "No space left on device"),
+            FileSystemError::InvalidPath => write!(f, "Invalid path"),
+            FileSystemError::IoError => write!(f, "I/O error"),
+            FileSystemError::NotImplemented => write!(f, "Not implemented"),
+            FileSystemError::AlreadyExists => write!(f, "File or directory already exists"),
+            FileSystemError::NotADirectory => write!(f, "Not a directory"),
+            FileSystemError::NotAFile => write!(f, "Is a directory"),
+            FileSystemError::Custom(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+/// Format a filesystem error as a user-facing message including the path.
+fn fs_error(path: &str, err: FileSystemError) -> String {
+    format!("{}: {}", path, err)
+}
+
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub name: String,
@@ -68,44 +90,72 @@ pub fn init() {
     let _ = FILESYSTEM.lock();
 }
 
-pub fn list_directory(path: &str) -> Vec<String> {
+/// List a directory. Errors (missing path, not a directory) are returned so
+/// the shell can show a clear message instead of "(empty directory)".
+pub fn list_directory(path: &str) -> Result<Vec<String>, String> {
     let path_to_list = if path.is_empty() { "." } else { path };
-    match FILESYSTEM.lock().list_directory(path_to_list) {
-        Ok(entries) => {
-            entries.iter().map(|e| {
-                let type_char = if e.is_directory { "d" } else { "-" };
-                format!("{} {} {} bytes", type_char, e.name, e.size)
-            }).collect()
-        }
-        Err(_) => Vec::new(),
-    }
+    let entries = FILESYSTEM
+        .lock()
+        .list_directory(path_to_list)
+        .map_err(|e| fs_error(path_to_list, e))?;
+    Ok(entries
+        .iter()
+        .map(|e| {
+            let type_char = if e.is_directory { "d" } else { "-" };
+            format!("{} {} {} bytes", type_char, e.name, e.size)
+        })
+        .collect())
 }
 
 pub fn change_directory(path: &str) -> Result<(), String> {
-    FILESYSTEM.lock().set_current_directory(path)
-        .map_err(|e| format!("{:?}", e))
+    FILESYSTEM
+        .lock()
+        .set_current_directory(path)
+        .map_err(|e| fs_error(path, e))
 }
 
+/// Create a file with content. Overwrites the contents of an existing regular
+/// file; creates a new file only when the path does not exist yet.
 pub fn create_file(name: &str, content: Vec<u8>) -> Result<(), String> {
     let mut fs = FILESYSTEM.lock();
-    fs.create_file(name).map_err(|e| format!("{:?}", e))?;
-    fs.write_file(name, &content)
-        .map_err(|e| format!("{:?}", e))
+    let result = if fs.is_file(name) {
+        fs.write_file(name, &content)
+    } else if fs.is_directory(name) {
+        Err(FileSystemError::NotAFile)
+    } else {
+        fs.create_file(name)
+            .and_then(|()| fs.write_file(name, &content))
+    };
+    result.map_err(|e| fs_error(name, e))
 }
 
 pub fn read_file(name: &str) -> Result<Vec<u8>, String> {
-    FILESYSTEM.lock().read_file(name)
-        .map_err(|e| format!("{:?}", e))
+    FILESYSTEM
+        .lock()
+        .read_file(name)
+        .map_err(|e| fs_error(name, e))
 }
 
 pub fn create_directory(name: &str) -> Result<(), String> {
-    FILESYSTEM.lock().create_directory(name)
-        .map_err(|e| format!("{:?}", e))
+    FILESYSTEM
+        .lock()
+        .create_directory(name)
+        .map_err(|e| fs_error(name, e))
 }
 
 pub fn remove_file(name: &str) -> Result<(), String> {
-    FILESYSTEM.lock().delete_file(name)
-        .map_err(|e| format!("{:?}", e))
+    FILESYSTEM
+        .lock()
+        .delete_file(name)
+        .map_err(|e| fs_error(name, e))
+}
+
+/// Remove an empty directory (shell `rmdir`).
+pub fn remove_directory(name: &str) -> Result<(), String> {
+    FILESYSTEM
+        .lock()
+        .delete_directory(name)
+        .map_err(|e| fs_error(name, e))
 }
 
 pub fn get_current_path() -> String {
