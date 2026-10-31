@@ -36,7 +36,7 @@ Notes:
 
 ### Boot Process Flow
 1. **UEFI Entry** (`src/main.rs`): Captures framebuffer info from GOP, then calls `ExitBootServices()`. After this point no UEFI services exist.
-2. **Kernel Entry** (`src/kernel.rs:kernel_main`): Disables interrupts, then initializes in strict order: terminal → heap allocator → CPU features (FPU/SSE) → GDT → IDT → PIC → filesystem → enable interrupts → shell. Filesystem init must stay before interrupt enable so no IRQ can arrive while its locks are held.
+2. **Kernel Entry** (`src/kernel.rs:kernel_main`): Disables interrupts, then initializes in strict order: terminal → heap allocator → CPU features (FPU/SSE) → GDT → IDT → PIC → memory map + frame allocator → filesystem → enable interrupts → shell. Filesystem init must stay before interrupt enable so no IRQ can arrive while its locks are held.
 3. **Runtime**: The keyboard ISR only enqueues raw scancodes (`keyboard::add_scancode` → `SCANCODE_QUEUE`). The main loop in `kernel_main` drains the queue in thread context (`try_pop_scancode` with interrupts disabled, `enable_and_hlt` when empty) and dispatches: scancode → ASCII → `shell::handle_input` → command execution.
 
 ### Critical Components
@@ -46,9 +46,13 @@ Notes:
 - `src/interrupts.rs`: IDT with CPU exception handlers (breakpoint, page fault, GPF, invalid opcode, double fault) and hardware IRQs (timer, keyboard). Timer increments `pic::TICKS` for uptime.
 - `src/pic.rs`: Legacy 8259 PIC (not APIC); handlers must send EOI
 
-**Memory**:
-- `src/allocator.rs`: Bump allocator over a 100 KiB static buffer, registered as `#[global_allocator]`. `dealloc` only resets when the allocation count hits zero — long-running allocation churn will exhaust the heap. `alloc` types (String, Vec, Box) are available throughout the kernel.
-- No paging/virtual memory management beyond what UEFI leaves behind.
+**Memory** (`src/allocator.rs`, `src/memory.rs`):
+- `src/main.rs` retains the memory map returned by `ExitBootServices()` (it is `'static`) and passes it to `kernel_main`.
+- `src/memory.rs` (issue #5 stage 1): copies a compact summary of the firmware map into `MEMORY_SUMMARY` (`spin::Mutex` over a fixed 64-region static array; `phys_start`, `page_count`, memory type) and prints total usable RAM, region count, and free-frame count in the boot log. Regions starting above 4 GiB are ignored (and counted in the log).
+- `src/memory.rs` also holds the physical frame allocator: `FRAME_ALLOCATOR: spin::Mutex<BitmapFrameAllocator>` over a static 128 KiB bitmap (1 bit per 4 KiB frame, low 4 GiB = 1,048,576 frames). The static is zero-filled (.bss — no EFI file cost); init marks every bit used, then clears the frames of CONVENTIONAL regions below 4 GiB. `allocate_frame() -> Option<u64>` returns identity-mapped physical addresses (no paging layer yet); `free_frame(addr)` clears the bit (callers must only free frames from `allocate_frame`; double frees are ignored).
+- `src/allocator.rs`: heap = `linked_list_allocator::LockedHeap` (frees and coalesces) over a static 1 MiB page-aligned area in .bss, registered as `#[global_allocator]`; `init_heap()` hands it the area exactly once before any allocation. `alloc` types (String, Vec, Box) are available throughout the kernel and deallocation reclaims memory — shell churn no longer leaks.
+- Both `MEMORY_SUMMARY` and `FRAME_ALLOCATOR` are thread-context-only spin locks (single-core kernel; never take them from an ISR — if that ever changes, disable interrupts around the lock like `SCANCODE_QUEUE` takers do).
+- No paging/virtual memory management beyond what UEFI leaves behind (stage 2 of issue #5).
 
 **Filesystem** (`src/fs/`):
 - `mod.rs` defines a `FileSystem` trait and a global `FILESYSTEM: Mutex<Box<dyn FileSystem>>` behind free-function wrappers (`fs::read_file`, `fs::list_directory`, etc.) used by the shell.
@@ -76,5 +80,5 @@ Work is tracked as GitHub Issues on `hnkNkm/ilo-lawa` (`gh issue list`), labeled
 - **Crashes after enabling interrupts**: Check GDT segment selectors, ensure all segments are properly initialized
 - **Double faults**: Verify IST stack is properly allocated and TSS is loaded
 - **Keyboard not working**: Ensure PIC mask enables IRQ1, check EOI is sent properly
-- **Allocation failures / panics in shell commands**: The 100 KiB bump heap doesn't truly free; reduce allocations or grow `HEAP_SIZE` in `src/allocator.rs`
+- **Allocation failures / panics in shell commands**: the heap is a fixed static 1 MiB `linked_list_allocator` area; if commands OOM, look for leaked allocations first, then grow `HEAP_SIZE` in `src/allocator.rs`
 - **Build failures**: Always build inside `nix develop --impure`
