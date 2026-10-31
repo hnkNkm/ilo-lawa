@@ -45,7 +45,8 @@ pub struct RegionInfo {
     pub ty: MemoryType,
 }
 
-/// Heap-free snapshot of the firmware memory map.
+/// Heap-free snapshot of the firmware memory map (logging only — the
+/// frame allocator pass iterates the full map).
 pub struct MemorySummary {
     regions: [Option<RegionInfo>; MAX_REGIONS],
     /// Regions retained (capped at MAX_REGIONS).
@@ -54,8 +55,6 @@ pub struct MemorySummary {
     total: usize,
     /// Regions dropped because they started above 4 GiB.
     ignored_above_4g: usize,
-    /// Total CONVENTIONAL bytes below 4 GiB (the frame allocator's pool).
-    total_usable_bytes: u64,
 }
 
 pub static MEMORY_SUMMARY: Mutex<MemorySummary> = Mutex::new(MemorySummary::new());
@@ -67,7 +66,6 @@ impl MemorySummary {
             count: 0,
             total: 0,
             ignored_above_4g: 0,
-            total_usable_bytes: 0,
         }
     }
 }
@@ -129,6 +127,9 @@ impl BitmapFrameAllocator {
     /// base address (usable directly as a virtual address — no paging
     /// layer exists yet).
     pub fn allocate_frame(&mut self) -> Option<u64> {
+        if self.free_frames == 0 {
+            return None;
+        }
         for (word_idx, &word) in self.bitmap.iter().enumerate() {
             if word != u64::MAX {
                 let bit = word.trailing_ones();
@@ -171,6 +172,9 @@ impl BitmapFrameAllocator {
 /// frame allocator. Runs in thread context before interrupts are enabled;
 /// prints the memory summary to the boot log (serial + framebuffer).
 pub fn init(memory_map: &MemoryMap<'static>) {
+    // Pass 1: compact 64-region summary, for the boot log only. The frame
+    // allocator pass below must see every descriptor, so regions beyond
+    // this log cap stay allocatable.
     {
         let mut summary = MEMORY_SUMMARY.lock();
         for desc in memory_map.entries() {
@@ -186,37 +190,72 @@ pub fn init(memory_map: &MemoryMap<'static>) {
             }
             if desc.phys_start >= MAX_SUPPORTED_PHYS {
                 summary.ignored_above_4g += 1;
-            } else if desc.ty == MemoryType::CONVENTIONAL {
-                summary.total_usable_bytes += desc.page_count * FRAME_SIZE;
             }
         }
     }
 
-    // Feed usable regions to the frame allocator from the retained copy.
-    {
-        let summary = MEMORY_SUMMARY.lock();
+    // Pass 2: every descriptor feeds the frame allocator.
+    let (free_frames, usable_frames, usable_mib) = {
         let mut allocator = FRAME_ALLOCATOR.lock();
         allocator.fill_used();
-        for i in 0..summary.count {
-            if let Some(region) = summary.regions[i] {
-                if region.ty == MemoryType::CONVENTIONAL {
-                    allocator.mark_region_free(&region);
-                }
+        for desc in memory_map.entries() {
+            if desc.ty == MemoryType::CONVENTIONAL {
+                allocator.mark_region_free(&RegionInfo {
+                    phys_start: desc.phys_start,
+                    page_count: desc.page_count,
+                    ty: desc.ty,
+                });
             }
         }
-        let usable_mib = summary.total_usable_bytes / (1024 * 1024);
-        terminal::print_fmt(format_args!(
-            "Memory map: {} of {} region(s) retained (cap {}), {} above 4 GiB ignored\n",
-            summary.count, summary.total, MAX_REGIONS, summary.ignored_above_4g
-        ));
-        terminal::print_fmt(format_args!(
-            "Usable RAM (CONVENTIONAL, below 4 GiB): {} MiB\n",
-            usable_mib
-        ));
-        terminal::print_fmt(format_args!(
-            "Frame allocator: {} frames usable, {} free (4 KiB each)\n",
+        self_check(&mut allocator);
+        (
+            allocator.free_frame_count(),
             allocator.usable_frame_count(),
-            allocator.free_frame_count()
-        ));
-    }
+            allocator.usable_frame_count() * FRAME_SIZE / (1024 * 1024),
+        )
+    };
+
+    let summary = MEMORY_SUMMARY.lock();
+    terminal::print_fmt(format_args!(
+        "Memory map: {} of {} region(s) retained for logging (cap {}), {} above 4 GiB ignored\n",
+        summary.count, summary.total, MAX_REGIONS, summary.ignored_above_4g
+    ));
+    terminal::print_fmt(format_args!(
+        "Usable RAM (CONVENTIONAL, below 4 GiB): {} MiB\n",
+        usable_mib
+    ));
+    terminal::print_fmt(format_args!(
+        "Frame allocator: {} frames usable, {} free (4 KiB each)\n",
+        usable_frames, free_frames
+    ));
+}
+
+/// Boot-time self-check of the frame allocator: exercise the API once
+/// without permanently consuming a frame (the frame's memory itself is
+/// never touched). Panics on invariant mismatch instead of letting the
+/// kernel run with a broken allocator.
+fn self_check(allocator: &mut BitmapFrameAllocator) {
+    let before = allocator.free_frame_count();
+    let frame = allocator
+        .allocate_frame()
+        .expect("frame allocator self-check: no free frame right after init");
+    assert!(
+        frame % FRAME_SIZE == 0,
+        "frame allocator self-check: frame {:#x} not 4 KiB-aligned",
+        frame
+    );
+    assert!(
+        frame < MAX_SUPPORTED_PHYS,
+        "frame allocator self-check: frame {:#x} outside the 4 GiB window",
+        frame
+    );
+    allocator.free_frame(frame);
+    let after = allocator.free_frame_count();
+    assert!(
+        after == before,
+        "frame allocator self-check: free count {} did not return to {}",
+        after,
+        before
+    );
+    terminal::print("Frame allocator self-check OK\n");
 }
