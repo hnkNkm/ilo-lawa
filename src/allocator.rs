@@ -1,97 +1,39 @@
-// Simple bump allocator for heap memory management
+// Heap allocator: linked_list_allocator's `LockedHeap` over a static,
+// page-aligned 1 MiB area. Freed blocks are returned to the allocator's
+// free list and coalesced with neighbours, so shell churn (per-command
+// Strings, history, FS tree edits) no longer leaks — the previous bump
+// allocator only recovered the whole heap when the allocation count hit
+// zero, which never happened with persistent allocations alive.
 
-use alloc::alloc::{GlobalAlloc, Layout};
-use core::ptr::null_mut;
-use spin::Mutex;
+use alloc::alloc::Layout;
+use linked_list_allocator::LockedHeap;
 
-pub const HEAP_START: usize = 0x_4444_4444_0000;
-pub const HEAP_SIZE: usize = 100 * 1024; // 100 KiB
+/// 1 MiB static heap. Lives in .bss: it costs no bytes in the EFI image
+/// file, but adds 1 MiB to the kernel's memory footprint at boot.
+pub const HEAP_SIZE: usize = 1024 * 1024;
 
-struct BumpAllocator {
-    heap_start: usize,
-    heap_end: usize,
-    next: usize,
-    allocations: usize,
-}
+/// Page-aligned backing area; `Heap::init` requires its bottom pointer to
+/// be suitably aligned for the largest hole header. The bytes are never
+/// read by kernel code — only handed to the allocator.
+#[repr(C, align(4096))]
+#[allow(dead_code)]
+struct HeapArea([u8; HEAP_SIZE]);
 
-impl BumpAllocator {
-    pub const fn new() -> Self {
-        BumpAllocator {
-            heap_start: 0,
-            heap_end: 0,
-            next: 0,
-            allocations: 0,
-        }
-    }
-
-    pub unsafe fn init(&mut self, heap_start: usize, heap_size: usize) {
-        self.heap_start = heap_start;
-        self.heap_end = heap_start + heap_size;
-        self.next = heap_start;
-    }
-}
-
-// Wrapper struct to avoid orphan rule
-pub struct LockedHeap(Mutex<BumpAllocator>);
-
-impl LockedHeap {
-    pub const fn new() -> Self {
-        LockedHeap(Mutex::new(BumpAllocator::new()))
-    }
-}
-
-unsafe impl GlobalAlloc for LockedHeap {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let mut allocator = self.0.lock();
-
-        // Align the allocation
-        let alloc_start = align_up(allocator.next, layout.align());
-        let alloc_end = match alloc_start.checked_add(layout.size()) {
-            Some(end) => end,
-            None => return null_mut(),
-        };
-
-        if alloc_end > allocator.heap_end {
-            null_mut() // Out of memory
-        } else {
-            allocator.next = alloc_end;
-            allocator.allocations += 1;
-            alloc_start as *mut u8
-        }
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        let mut allocator = self.0.lock();
-        allocator.allocations -= 1;
-        
-        // Simple bump allocator doesn't actually free memory
-        // Reset only when all allocations are freed
-        if allocator.allocations == 0 {
-            allocator.next = allocator.heap_start;
-        }
-    }
-}
+static mut HEAP_AREA: HeapArea = HeapArea([0; HEAP_SIZE]);
 
 #[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::new();
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
+/// Hand the static heap area to the allocator. Must be called exactly
+/// once, before any allocation, from kernel_main's init sequence.
 pub fn init_heap() {
-    // Create a simple heap in a static buffer
-    static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
-    
     unsafe {
-        ALLOCATOR.0.lock().init(
-            &raw const HEAP as usize,
-            HEAP_SIZE,
-        );
+        let bottom = &raw mut HEAP_AREA as *mut u8;
+        ALLOCATOR.lock().init(bottom, HEAP_SIZE);
     }
-}
-
-fn align_up(addr: usize, align: usize) -> usize {
-    (addr + align - 1) & !(align - 1)
 }
 
 #[alloc_error_handler]
-fn alloc_error_handler(layout: alloc::alloc::Layout) -> ! {
+fn alloc_error_handler(layout: Layout) -> ! {
     panic!("Allocation error: {:?}", layout)
 }

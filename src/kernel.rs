@@ -120,8 +120,9 @@ impl KernelGraphics {
     }
 }
 
-// The actual kernel entry point after ExitBootServices
-pub fn kernel_main(fb_info: FramebufferInfo) -> ! {
+// The actual kernel entry point after ExitBootServices. The UEFI memory
+// map is retained here (see memory::init) rather than discarded.
+pub fn kernel_main(fb_info: FramebufferInfo, memory_map: uefi::table::boot::MemoryMap<'static>) -> ! {
     // CRITICAL: Disable interrupts immediately after ExitBootServices
     x86_64::instructions::interrupts::disable();
 
@@ -161,6 +162,12 @@ pub fn kernel_main(fb_info: FramebufferInfo) -> ! {
     // Initialize PIC
     crate::terminal::print("Initializing PIC...");
     unsafe { crate::pic::PICS.lock().initialize() };
+    crate::terminal::print(" [OK]\n");
+
+    // Retain the UEFI memory map and bring up the physical frame
+    // allocator (thread context, interrupts still disabled)
+    crate::terminal::print("Initializing memory management...\n");
+    crate::memory::init(&memory_map);
     crate::terminal::print(" [OK]\n");
 
     // Initialize filesystem BEFORE enabling interrupts: its allocations

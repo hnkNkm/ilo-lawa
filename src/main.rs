@@ -20,6 +20,7 @@ mod cpu;
 mod allocator;
 mod shell;
 mod fs;
+mod memory;
 
 use kernel::{FramebufferInfo, kernel_main};
 use core::panic::PanicInfo;
@@ -68,12 +69,14 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         .unwrap();
     
     // EXIT BOOT SERVICES - After this, no UEFI services available!
-    let (_system_table_runtime, _memory_map) = system_table
+    // The returned memory map is 'static (its backing allocation survives
+    // ExitBootServices) and is handed to the kernel to retain.
+    let (_system_table_runtime, memory_map) = system_table
         .exit_boot_services(uefi::table::boot::MemoryType::LOADER_DATA);
-    
+
     // WE ARE NOW IN KERNEL MODE!
     // No more UEFI services, we're on our own
-    kernel_main(fb_info);
+    kernel_main(fb_info, memory_map);
 }
 
 #[panic_handler]
