@@ -30,6 +30,40 @@ impl KernelGraphics {
             }
         }
     }
+
+    /// Shift the whole framebuffer up by `pixels` scanlines and fill the
+    /// newly exposed bottom strip with `fill_color`. Used for text scrolling:
+    /// the caller passes CHAR_HEIGHT + LINE_SPACING so exactly one text row
+    /// moves up. Everything above the strip is moved with `core::ptr::copy`
+    /// (memmove), which is defined for the overlapping ranges we get here.
+    pub fn scroll_up(&self, pixels: usize, fill_color: u32) {
+        let width = self.fb_info.width;
+        let height = self.fb_info.height;
+        let stride = self.fb_info.stride;
+
+        // Degenerate framebuffer or oversized scroll: nothing sane to move.
+        if pixels == 0 || width == 0 || height == 0 || stride == 0 {
+            return;
+        }
+        if pixels >= height {
+            self.clear(fill_color);
+            return;
+        }
+
+        let fb = self.fb_info.base_address as *mut u32;
+        unsafe {
+            // Move everything below the scrolled-off strip up as one block.
+            // One u32 per pixel; `stride` covers the padding between rows too.
+            core::ptr::copy(
+                fb.add(pixels * stride),
+                fb,
+                (height - pixels) * stride,
+            );
+        }
+
+        // Clear the strip that was exposed at the bottom.
+        self.draw_rect(0, height - pixels, width, pixels, fill_color);
+    }
     
     pub fn draw_pixel(&self, x: usize, y: usize, color: u32) {
         if x >= self.fb_info.width || y >= self.fb_info.height {
