@@ -36,15 +36,21 @@ Notes:
 
 ### Boot Process Flow
 1. **UEFI Entry** (`src/main.rs`): Captures framebuffer info from GOP, then calls `ExitBootServices()`. After this point no UEFI services exist.
-2. **Kernel Entry** (`src/kernel.rs:kernel_main`): Disables interrupts, then initializes in strict order: terminal → heap allocator → CPU features (FPU/SSE) → GDT → IDT → PIC → memory map + frame allocator → filesystem → enable interrupts → shell. Filesystem init must stay before interrupt enable so no IRQ can arrive while its locks are held.
+2. **Kernel Entry** (`src/kernel.rs:kernel_main`): Disables interrupts, then initializes in strict order: terminal → heap allocator → CPU features (FPU/SSE) → GDT → IDT → PIC → memory map + frame allocator → filesystem → PIT timer (100 Hz) → enable interrupts → shell. Filesystem init must stay before interrupt enable so no IRQ can arrive while its locks are held; the PIT is programmed after the PIC (IRQ0 routed) and before interrupts are enabled.
 3. **Runtime**: The keyboard ISR only enqueues raw scancodes (`keyboard::add_scancode` → `SCANCODE_QUEUE`). The main loop in `kernel_main` drains the queue in thread context (`try_pop_scancode` with interrupts disabled, `enable_and_hlt` when empty) and dispatches: scancode → ASCII → `shell::handle_input` → command execution.
 
 ### Critical Components
 
 **Interrupt Architecture**:
 - `src/gdt.rs`: GDT with TSS; IST stack for double faults (`DOUBLE_FAULT_IST_INDEX`)
-- `src/interrupts.rs`: IDT with CPU exception handlers (breakpoint, page fault, GPF, invalid opcode, double fault) and hardware IRQs (timer, keyboard). Timer increments `pic::TICKS` for uptime.
+- `src/interrupts.rs`: IDT with CPU exception handlers (breakpoint, page fault, GPF, invalid opcode, double fault) and hardware IRQs (timer, keyboard). Timer ISR calls `time::tick()` (atomic increment) and sends EOI — nothing else.
 - `src/pic.rs`: Legacy 8259 PIC (not APIC); handlers must send EOI
+
+**Timer & Time** (`src/time.rs`):
+- PIT 8253/8254 channel 0 programmed to 100 Hz (base 1,193,182 Hz, divisor 11,932, command 0x36 → port 0x43, divisor → port 0x40) by `time::init()`; tick = 10 ms.
+- `static TICKS: AtomicU64` (`Ordering::Relaxed`) incremented by the timer ISR via `time::tick()`; readers: `ticks()`, `uptime_seconds()`.
+- `sleep_ticks(n)` / `sleep_ms(ms)`: hlt-loop until the target tick — thread context with interrupts enabled ONLY (never from an ISR or with interrupts disabled). 10 ms resolution; `sleep_ms` rounds up to whole ticks, `ms == 0` returns immediately.
+- Consumers: shell `uptime` command (days + HH:MM:SS) and `sleep <ms>` command.
 
 **Memory** (`src/allocator.rs`, `src/memory.rs`):
 - `src/main.rs` retains the memory map returned by `ExitBootServices()` (it is `'static`) and passes it to `kernel_main`.
@@ -61,7 +67,7 @@ Notes:
 
 **Shell & I/O**:
 - `src/serial.rs`: Polled 16550 COM1 driver. ALL terminal output is mirrored to serial (serial lock taken before, never nested with, the terminal lock), so QEMU's `-serial stdio`/`-serial file:` captures the boot log and entire shell session — the primary debugging channel. Thread context + panic path only; never from ISRs.
-- `src/shell.rs`: Command parsing, history (10 entries), built-ins (help, echo, version, reboot, ...) and filesystem commands (ls, cd, pwd, cat, mkdir, rm, write). Global singleton behind `spin::Mutex` — command handlers run in the kernel main loop (thread context), fed one character at a time from the scancode queue.
+- `src/shell.rs`: Command parsing, history (10 entries), built-ins (help, echo, version, uptime, sleep, reboot, ...) and filesystem commands (ls, cd, pwd, cat, mkdir, rm, write). Global singleton behind `spin::Mutex` — command handlers run in the kernel main loop (thread context), fed one character at a time from the scancode queue.
 - `src/terminal.rs`: Framebuffer text terminal (8x8 font from `src/font.rs`, direct pixel writes). Scrolling shifts the framebuffer up one text row (10 px) via `KernelGraphics::scroll_up` memmove and clears only the exposed bottom row.
 - `src/keyboard.rs`: Scancode set 1 → ASCII, tracks Shift/Ctrl state.
 

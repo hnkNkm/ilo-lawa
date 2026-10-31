@@ -176,6 +176,13 @@ pub fn kernel_main(fb_info: FramebufferInfo, memory_map: uefi::table::boot::Memo
     crate::fs::init();
     crate::terminal::print(" [OK]\n");
 
+    // Program the PIT (100 Hz) after the PIC (IRQ0 routed and unmasked)
+    // and before enabling interrupts, so the first tick is serviced by a
+    // fully set-up timer.
+    crate::terminal::print("Initializing PIT timer (100 Hz)...");
+    crate::time::init();
+    crate::terminal::print(" [OK]\n");
+
     crate::terminal::print("\nInterrupt system ready.\n");
     crate::terminal::print("Enabling interrupts...");
 
