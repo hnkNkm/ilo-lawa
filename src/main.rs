@@ -13,6 +13,7 @@ mod kernel;
 mod gdt;
 mod interrupts;
 mod pic;
+mod time;
 mod keyboard;
 mod terminal;
 mod serial;

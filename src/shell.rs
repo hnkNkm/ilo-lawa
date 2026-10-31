@@ -100,6 +100,7 @@ impl Shell {
             "echo" => self.cmd_echo(args),
             "version" => self.cmd_version(),
             "uptime" => self.cmd_uptime(),
+            "sleep" => self.cmd_sleep(args),
             "history" => self.cmd_history(),
             "shutdown" => self.cmd_shutdown(),
             "reboot" => self.cmd_reboot(),
@@ -166,6 +167,7 @@ impl Shell {
         crate::terminal::print("  echo     - Print arguments to screen\n");
         crate::terminal::print("  version  - Show OS version\n");
         crate::terminal::print("  uptime   - Show system uptime\n");
+        crate::terminal::print("  sleep    - Sleep for <ms> milliseconds\n");
         crate::terminal::print("  history  - Show command history\n");
         crate::terminal::print("  shutdown - Shutdown the system\n");
         crate::terminal::print("  reboot   - Reboot the system\n");
@@ -201,8 +203,46 @@ impl Shell {
     }
     
     fn cmd_uptime(&self) {
-        // TODO: Implement actual uptime tracking
-        crate::terminal::print("System has been running for: [not implemented]\n");
+        // days + HH:MM:SS, decimal digits printed directly — no floats,
+        // no format! allocations (issue #7).
+        let secs = crate::time::uptime_seconds();
+        let days = secs / 86_400;
+        let hours = (secs % 86_400) / 3_600;
+        let mins = (secs % 3_600) / 60;
+        let secs = secs % 60;
+        crate::terminal::print("System uptime: ");
+        print_u64(days);
+        crate::terminal::print_char('d');
+        crate::terminal::print_char(' ');
+        print_two_digits(hours);
+        crate::terminal::print_char(':');
+        print_two_digits(mins);
+        crate::terminal::print_char(':');
+        print_two_digits(secs);
+        crate::terminal::print_char('\n');
+    }
+
+    fn cmd_sleep(&self, args: &[&str]) {
+        let arg = self.get_first_arg(args, "");
+        if arg.is_empty() {
+            crate::terminal::print("Usage: sleep <ms>\n");
+            return;
+        }
+        match arg.parse::<u64>() {
+            Ok(ms) => {
+                // Thread-context sleep on the PIT tick; wakes at the next
+                // tick boundary at or after `ms` (10 ms resolution).
+                crate::time::sleep_ms(ms);
+                crate::terminal::print("Slept ");
+                crate::terminal::print(arg);
+                crate::terminal::print(" ms\n");
+            }
+            Err(_) => {
+                crate::terminal::print("sleep: invalid duration '");
+                crate::terminal::print(arg);
+                crate::terminal::print("'\nUsage: sleep <ms>\n");
+            }
+        }
     }
     
     fn cmd_history(&self) {
@@ -390,6 +430,30 @@ impl Shell {
             }
         }
     }
+}
+
+// Print a u64 in decimal directly to the terminal — no allocator use.
+fn print_u64(mut value: u64) {
+    if value == 0 {
+        crate::terminal::print_char('0');
+        return;
+    }
+    let mut digits = [0u8; 20]; // enough for u64::MAX
+    let mut i = digits.len();
+    while value > 0 && i > 0 {
+        i -= 1;
+        digits[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    for d in &digits[i..] {
+        crate::terminal::print_char(*d as char);
+    }
+}
+
+// Print a value zero-padded to two digits (HH:MM:SS fields).
+fn print_two_digits(value: u64) {
+    crate::terminal::print_char((b'0' + (value / 10) as u8) as char);
+    crate::terminal::print_char((b'0' + (value % 10) as u8) as char);
 }
 
 // Public interface
