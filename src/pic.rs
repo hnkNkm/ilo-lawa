@@ -24,10 +24,6 @@ impl Pic {
         self.command.write(CMD_END_OF_INTERRUPT);
     }
     
-    unsafe fn read_mask(&mut self) -> u8 {
-        self.data.read()
-    }
-    
     unsafe fn write_mask(&mut self, mask: u8) {
         self.data.write(mask);
     }
@@ -58,10 +54,6 @@ impl ChainedPics {
     pub unsafe fn initialize(&mut self) {
         let mut wait_port: Port<u8> = Port::new(0x80);
         let mut wait = || wait_port.write(0);
-        
-        // Save masks
-        let mask1 = self.pics[0].read_mask();
-        let mask2 = self.pics[1].read_mask();
         
         // Start initialization sequence
         self.pics[0].command.write(CMD_INIT);
@@ -114,10 +106,5 @@ impl ChainedPics {
     // cascade line (IRQ2) genuinely was, so only the master needs an EOI.
     pub unsafe fn notify_end_of_interrupt_master(&mut self) {
         self.pics[0].end_of_interrupt();
-    }
-    
-    pub unsafe fn disable(&mut self) {
-        self.pics[0].write_mask(0xff);
-        self.pics[1].write_mask(0xff);
     }
 }

@@ -310,7 +310,7 @@ impl Shell {
     }
     
     fn cmd_version(&self) {
-        crate::terminal::print("ilo-lawa OS v0.4.0\n");
+        crate::terminal::print(concat!("ilo-lawa OS v", env!("CARGO_PKG_VERSION"), "\n"));
         crate::terminal::print("Built with Rust and UEFI\n");
     }
     
@@ -571,7 +571,7 @@ fn print_two_digits(value: u64) {
 // Public interface
 pub fn init() {
     crate::terminal::print("\n");
-    crate::terminal::print("ilo-lawa Shell v0.1.0\n");
+    crate::terminal::print(concat!("ilo-lawa Shell v", env!("CARGO_PKG_VERSION"), "\n"));
     crate::terminal::print("Type 'help' for available commands.\n");
     crate::terminal::print("\n");
     SHELL.lock().print_prompt();

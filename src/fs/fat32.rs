@@ -1,8 +1,12 @@
 // FAT32 filesystem implementation
+//
+// Forward-looking driver staged for issue #14: the block-device layer it
+// needs is not wired up yet, so most items are intentionally unused.
+#![allow(dead_code)]
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::{format, vec};
+use alloc::vec;
 use super::{FileSystem as FSTrait, FileSystemError, DirEntry};
 
 // FAT32 Constants
@@ -255,10 +259,6 @@ impl FSTrait for Fat32FileSystem {
         }
         
         Ok(entries)
-    }
-    
-    fn exists(&mut self, _path: &str) -> bool {
-        false
     }
     
     fn is_directory(&mut self, _path: &str) -> bool {

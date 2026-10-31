@@ -67,7 +67,7 @@ Notes:
 **Filesystem** (`src/fs/`):
 - `mod.rs` defines a `FileSystem` trait and a global `FILESYSTEM: Mutex<Box<dyn FileSystem>>` behind free-function wrappers (`fs::read_file`, `fs::list_directory`, etc.) used by the shell.
 - `memory.rs` is the active implementation: a RAM tree seeded with `/bin`, `/home`, `/etc`, and `README.txt`.
-- `fat32.rs` exists (boot sector / dir entry structs) but is not wired in yet.
+- `fat32.rs` is a forward-looking FAT32 driver for issue #14 and is not wired in yet; it carries the repo's only targeted lint allowance (`#![allow(dead_code)]` with an issue reference at the top of the file) until then. Don't blanket-allow dead code elsewhere.
 
 **Shell & I/O**:
 - `src/serial.rs`: Polled 16550 COM1 driver. ALL terminal output is mirrored to serial (serial lock taken before, never nested with, the terminal lock), so QEMU's `-serial stdio`/`-serial file:` captures the boot log and entire shell session — the primary debugging channel. Thread context + panic path only; never from ISRs.
@@ -85,7 +85,8 @@ Notes:
 - All interrupt handlers must use `extern "x86-interrupt"` ABI
 - Framebuffer info must be captured before `ExitBootServices()`
 - All static mutable state is guarded with `spin::Mutex` (+ `lazy_static`). The ONLY lock shared between ISR and thread context is `SCANCODE_QUEUE` in `src/keyboard.rs`; thread-side takers must disable interrupts around it. Never call into `TERMINAL`, `SHELL`, `FILESYSTEM`, or the allocator from an interrupt handler — that reintroduces the single-core deadlock this design removed (issue #2)
-- Version string ("ilo-lawa OS v0.4.0") is duplicated in `kernel.rs` and `shell.rs`
+- Version comes from `Cargo.toml` alone (`env!("CARGO_PKG_VERSION")`, expanded at compile time — safe before the heap is up): kernel boot banner and the shell `version` command print `ilo-lawa OS v<version>`, the shell banner prints `ilo-lawa Shell v<version>`. Never hardcode version literals in source.
+- The release build is warning-free (issue #15). Keep it that way: fix warnings at the root; targeted allowances with an issue reference are the only acceptable form.
 
 ## Task Tracking
 

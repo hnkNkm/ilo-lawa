@@ -336,10 +336,6 @@ impl FSTrait for MemoryFileSystem {
         Ok(entries)
     }
     
-    fn exists(&mut self, path: &str) -> bool {
-        self.find_entry(path).is_some()
-    }
-    
     fn is_directory(&mut self, path: &str) -> bool {
         self.find_entry(path)
             .map(|e| matches!(e.file_type, FileType::Directory))
