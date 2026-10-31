@@ -151,10 +151,13 @@ impl MemoryFileSystem {
 }
 
 // Memory limits
-// The kernel heap is a small static buffer (see src/allocator.rs), so keep the
-// per-file limit conservative: a too-large write must fail with an error
-// before it can exhaust the heap (OOM panic), never fill it up.
-const MAX_FILE_SIZE: usize = 64 * 1024; // 64 KiB
+// The kernel heap is a small static bump buffer (see src/allocator.rs) that
+// does not reclaim freed memory until every allocation is dropped, and
+// write_file briefly holds both the old and the new file data during an
+// overwrite. Cap files at 32 KiB so even that worst case stays well below
+// the heap size and a too-large write fails with an error before it can
+// exhaust the heap (OOM panic).
+const MAX_FILE_SIZE: usize = 32 * 1024; // 32 KiB
 
 impl FSTrait for MemoryFileSystem {
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, FileSystemError> {
@@ -268,6 +271,13 @@ impl FSTrait for MemoryFileSystem {
         // Don't allow deleting root
         if normalized == "/" {
             return Err(FileSystemError::PermissionDenied);
+        }
+
+        // Don't leave the current directory dangling
+        if normalized == self.current_dir {
+            return Err(FileSystemError::Custom(
+                "cannot remove the current directory".into(),
+            ));
         }
 
         let (dir_path, dirname) = Self::split_last_component(&normalized);

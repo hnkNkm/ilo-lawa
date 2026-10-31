@@ -115,7 +115,8 @@ pub fn change_directory(path: &str) -> Result<(), String> {
 }
 
 /// Create a file with content. Overwrites the contents of an existing regular
-/// file; creates a new file only when the path does not exist yet.
+/// file; creates a new file only when the path does not exist yet. If the
+/// content write fails on a newly created file, the empty file is rolled back.
 pub fn create_file(name: &str, content: Vec<u8>) -> Result<(), String> {
     let mut fs = FILESYSTEM.lock();
     let result = if fs.is_file(name) {
@@ -123,8 +124,18 @@ pub fn create_file(name: &str, content: Vec<u8>) -> Result<(), String> {
     } else if fs.is_directory(name) {
         Err(FileSystemError::NotAFile)
     } else {
-        fs.create_file(name)
-            .and_then(|()| fs.write_file(name, &content))
+        match fs.create_file(name) {
+            Ok(()) => {
+                if let Err(write_err) = fs.write_file(name, &content) {
+                    // Roll back: don't leave an empty file behind
+                    let _ = fs.delete_file(name);
+                    Err(write_err)
+                } else {
+                    Ok(())
+                }
+            }
+            Err(e) => Err(e),
+        }
     };
     result.map_err(|e| fs_error(name, e))
 }
