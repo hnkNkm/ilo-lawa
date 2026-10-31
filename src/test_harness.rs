@@ -34,14 +34,16 @@ const HARNESS_DIR_FILE: &str = "/harness-dir/inner.txt";
 type TestFn = fn() -> Result<(), String>;
 
 /// (name, function) pairs, run in order. `fs_crud` must run before
-/// `path_normalization`: both use `/harness-dir` and each cleans up
-/// after itself.
-static TESTS: [(&str, TestFn); 5] = [
+/// `path_normalization`: both use `/harness-dir` and each cleans up after
+/// itself. `keyboard_decode` is a pure state-machine test with no
+/// resource or ordering constraints.
+static TESTS: [(&str, TestFn); 6] = [
     ("heap_churn", test_heap_churn),
     ("frame_allocator", test_frame_allocator),
     ("fs_crud", test_fs_crud),
     ("path_normalization", test_path_normalization),
     ("error_formatting", test_error_formatting),
+    ("keyboard_decode", test_keyboard_decode),
 ];
 
 /// Run all tests and exit QEMU with the aggregate status. Diverges.
@@ -336,5 +338,92 @@ fn test_error_formatting() -> Result<(), String> {
             return Err(format!("list of missing dir returned {} entries", entries.len()));
         }
     }
+    Ok(())
+}
+
+/// Keyboard decode state machine: extended (0xE0-prefixed) and plain
+/// scancodes must map to the right KeyEvents, fake shifts must not corrupt
+/// the modifier state, and Ctrl combos must resolve to CtrlC/CtrlL. Pure
+/// `Keyboard` state, no queue, shell, or IRQ involvement.
+fn test_keyboard_decode() -> Result<(), String> {
+    use crate::keyboard::{Keyboard, KeyEvent};
+
+    // Feed `scancodes` to a fresh Keyboard and require that exactly the
+    // expected events emerge (`None` = scancodes produce no event).
+    let expect = |scancodes: &[u8], expected: Option<KeyEvent>, desc: &str| {
+        let mut kb = Keyboard::new();
+        let mut events: Vec<KeyEvent> = Vec::new();
+        for sc in scancodes {
+            if let Some(event) = kb.process_scancode(*sc) {
+                events.push(event);
+            }
+        }
+        let matched = match (&events[..], &expected) {
+            ([], None) => true,
+            ([event], Some(expected)) => event == expected,
+            _ => false,
+        };
+        if matched {
+            Ok(())
+        } else {
+            Err(format!(
+                "{}: got {:?}, expected {:?}",
+                desc, events, expected
+            ))
+        }
+    };
+
+    // Extended prefix decoding (arrows, Home/End, Delete, keypad Enter).
+    expect(&[0xE0, 0x48], Some(KeyEvent::Up), "E0 48")?;
+    expect(&[0xE0, 0x50], Some(KeyEvent::Down), "E0 50")?;
+    expect(&[0xE0, 0x4B], Some(KeyEvent::Left), "E0 4B")?;
+    expect(&[0xE0, 0x4D], Some(KeyEvent::Right), "E0 4D")?;
+    expect(&[0xE0, 0x47], Some(KeyEvent::Home), "E0 47")?;
+    expect(&[0xE0, 0x4F], Some(KeyEvent::End), "E0 4F")?;
+    expect(&[0xE0, 0x53], Some(KeyEvent::Delete), "E0 53")?;
+    expect(&[0xE0, 0x1C], Some(KeyEvent::Enter), "E0 1C")?;
+
+    // Plain (non-extended) navigation and editing keys.
+    expect(&[0x48], Some(KeyEvent::Up), "48")?;
+    expect(&[0x4B], Some(KeyEvent::Left), "4B")?;
+    expect(&[0x53], Some(KeyEvent::Delete), "53")?;
+    expect(&[0x1C], Some(KeyEvent::Enter), "1C")?;
+    expect(&[0x0E], Some(KeyEvent::Backspace), "0E")?;
+
+    // Fake shifts (E0 2A before, E0 AA after an extended key) must be
+    // ignored AND must not set the shift state: plain 'a' after them.
+    expect(&[0xE0, 0x2A, 0x1E], Some(KeyEvent::Char('a')), "E0 2A 1E")?;
+    expect(
+        &[0xE0, 0x2A, 0xE0, 0xAA, 0x1E],
+        Some(KeyEvent::Char('a')),
+        "E0 2A E0 AA 1E",
+    )?;
+    expect(&[0xE0, 0xAA], None, "E0 AA ignored")?;
+    // ...while the real shift still applies: 2A 1E gives 'A'.
+    expect(&[0x2A, 0x1E], Some(KeyEvent::Char('A')), "2A 1E shift")?;
+
+    // Extended release codes are ignored.
+    for sc in [0xC8u8, 0xD0, 0xCB, 0xCD, 0xC7, 0xCF, 0xD3, 0x9C] {
+        expect(&[0xE0, sc], None, "E0 release")?;
+    }
+
+    // Ctrl+C / Ctrl+L; Ctrl release must clear the modifier.
+    expect(&[0x1D, 0x2E], Some(KeyEvent::CtrlC), "ctrl c")?;
+    expect(&[0x1D, 0x26], Some(KeyEvent::CtrlL), "ctrl l")?;
+    expect(
+        &[0x1D, 0x9D, 0x2E],
+        Some(KeyEvent::Char('c')),
+        "ctrl release",
+    )?;
+    // Right Ctrl (extended) tracks the same modifier.
+    expect(&[0xE0, 0x1D, 0x2E], Some(KeyEvent::CtrlC), "right ctrl c")?;
+    expect(
+        &[0xE0, 0x1D, 0xE0, 0x9D, 0x2E],
+        Some(KeyEvent::Char('c')),
+        "right ctrl release",
+    )?;
+    // Ctrl with an unbound character produces no event.
+    expect(&[0x1D, 0x1E], None, "ctrl a unbound")?;
+
     Ok(())
 }

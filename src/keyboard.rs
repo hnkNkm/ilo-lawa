@@ -47,9 +47,31 @@ lazy_static! {
     static ref KEYBOARD: Mutex<Keyboard> = Mutex::new(Keyboard::new());
 }
 
+/// A decoded key event consumed by the shell. Chars carry the Shift-applied
+/// ASCII character; everything else is a control/navigation action.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum KeyEvent {
+    Char(char),
+    Enter,
+    Backspace,
+    Delete,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    CtrlC,
+    CtrlL,
+}
+
 pub struct Keyboard {
     shift_pressed: bool,
     ctrl_pressed: bool,
+    /// Set by an 0xE0 prefix: the next scancode is decoded in extended
+    /// context (arrow/Home/End/Delete keys, keypad Enter, right Ctrl, fake
+    /// shifts) and the flag clears afterwards.
+    extended: bool,
 }
 
 impl Keyboard {
@@ -57,45 +79,109 @@ impl Keyboard {
         Keyboard {
             shift_pressed: false,
             ctrl_pressed: false,
+            extended: false,
         }
     }
-    
-    pub fn process_scancode(&mut self, scancode: u8) -> Option<char> {
-        // Handle special keys
+
+    /// Decode one scancode (set 1, including 0xE0-prefixed extended codes)
+    /// into an optional KeyEvent.
+    pub fn process_scancode(&mut self, scancode: u8) -> Option<KeyEvent> {
+        if scancode == 0xE0 {
+            // Extended prefix: only meaningful together with the next code.
+            self.extended = true;
+            return None;
+        }
+        // Consume the prefix flag before decoding; every path below leaves
+        // it cleared so a lost pair can never corrupt later normal keys.
+        let extended = core::mem::take(&mut self.extended);
+
+        if extended {
+            return self.process_extended(scancode);
+        }
+
         match scancode {
             0x2A | 0x36 => { // Left/Right Shift pressed
                 self.shift_pressed = true;
-                return None;
+                None
             }
             0xAA | 0xB6 => { // Left/Right Shift released
                 self.shift_pressed = false;
-                return None;
+                None
             }
-            0x1D => { // Ctrl pressed
+            0x1D => { // Left Ctrl pressed
                 self.ctrl_pressed = true;
-                return None;
+                None
             }
-            0x9D => { // Ctrl released
+            0x9D => { // Left Ctrl released
                 self.ctrl_pressed = false;
-                return None;
+                None
             }
-            _ => {}
+            // Only process key presses, not releases (bit 7 set = release).
+            _ if scancode & 0x80 != 0 => None,
+            0x1C => Some(KeyEvent::Enter),
+            0x0E => Some(KeyEvent::Backspace),
+            // Keypad navigation cluster. Caveat: with NumLock on these are
+            // the arrow/Home/End/Delete codes; with NumLock off real
+            // keyboards send digits here. We accept them as navigation
+            // unconditionally, which matches QEMU's default (NumLock on).
+            0x47 => Some(KeyEvent::Home),
+            0x48 => Some(KeyEvent::Up),
+            0x4B => Some(KeyEvent::Left),
+            0x4D => Some(KeyEvent::Right),
+            0x4F => Some(KeyEvent::End),
+            0x50 => Some(KeyEvent::Down),
+            0x53 => Some(KeyEvent::Delete),
+            _ => self.scancode_to_ascii(scancode).and_then(|c| self.char_event(c)),
         }
-        
-        // Only process key press, not release (bit 7 set = release)
-        if scancode & 0x80 != 0 {
-            return None;
-        }
-        
-        // Convert scancode to ASCII
-        let ascii = self.scancode_to_ascii(scancode);
-        ascii.map(|c| {
-            if self.shift_pressed {
-                self.apply_shift(c)
-            } else {
-                c
+    }
+
+    /// Decode an 0xE0-prefixed scancode (the prefix flag already consumed).
+    fn process_extended(&mut self, scancode: u8) -> Option<KeyEvent> {
+        match scancode {
+            // Fake shifts emitted around extended keys (2A/36 before, AA/B6
+            // after): ignore them entirely so they never corrupt the real
+            // shift state.
+            0x2A | 0x36 | 0xAA | 0xB6 => None,
+            0x1D => { // Right Ctrl pressed
+                self.ctrl_pressed = true;
+                None
             }
-        })
+            0x9D => { // Right Ctrl released
+                self.ctrl_pressed = false;
+                None
+            }
+            0x48 => Some(KeyEvent::Up),
+            0x50 => Some(KeyEvent::Down),
+            0x4B => Some(KeyEvent::Left),
+            0x4D => Some(KeyEvent::Right),
+            0x47 => Some(KeyEvent::Home),
+            0x4F => Some(KeyEvent::End),
+            0x53 => Some(KeyEvent::Delete),
+            0x1C => Some(KeyEvent::Enter), // keypad Enter
+            // Everything else — in particular the break codes of the
+            // navigation keys (E0 C8/D0/CB/CD/C7/CF/D3) and keypad Enter
+            // release (E0 9C) — produces no event.
+            _ => None,
+        }
+    }
+
+    /// Wrap a base ASCII char into an event, applying Shift and resolving
+    /// Ctrl combos. Ctrl+<char> yields an event only for C and L; Ctrl with
+    /// any other character produces no event.
+    fn char_event(&self, c: char) -> Option<KeyEvent> {
+        let c = if self.shift_pressed {
+            self.apply_shift(c)
+        } else {
+            c
+        };
+        if self.ctrl_pressed {
+            return match c.to_ascii_lowercase() {
+                'c' => Some(KeyEvent::CtrlC),
+                'l' => Some(KeyEvent::CtrlL),
+                _ => None,
+            };
+        }
+        Some(KeyEvent::Char(c))
     }
     
     fn scancode_to_ascii(&self, scancode: u8) -> Option<char> {
@@ -114,7 +200,7 @@ impl Keyboard {
             0x0B => Some('0'),
             0x0C => Some('-'),
             0x0D => Some('='),
-            0x0E => Some('\x08'), // Backspace
+            0x0E => None, // Backspace — decoded as KeyEvent::Backspace above
             0x0F => Some('\t'), // Tab
             0x10 => Some('q'),
             0x11 => Some('w'),
@@ -128,7 +214,7 @@ impl Keyboard {
             0x19 => Some('p'),
             0x1A => Some('['),
             0x1B => Some(']'),
-            0x1C => Some('\n'), // Enter
+            0x1C => None, // Enter — decoded as KeyEvent::Enter above
             0x1E => Some('a'),
             0x1F => Some('s'),
             0x20 => Some('d'),
@@ -197,11 +283,11 @@ pub fn try_pop_scancode() -> Option<u8> {
     SCANCODE_QUEUE.lock().pop()
 }
 
-/// Decode a scancode and feed the resulting character to the shell.
+/// Decode a scancode and feed the resulting key event to the shell.
 /// Runs in normal thread context, never inside an ISR.
 pub fn handle_scancode(scancode: u8) {
-    let c = KEYBOARD.lock().process_scancode(scancode);
-    if let Some(c) = c {
-        crate::shell::handle_input(c);
+    let event = KEYBOARD.lock().process_scancode(scancode);
+    if let Some(event) = event {
+        crate::shell::handle_key_event(event);
     }
 }
