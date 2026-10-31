@@ -32,13 +32,12 @@ impl Shell {
     pub fn handle_key(&mut self, c: char) {
         match c {
             '\n' => {
-                // Execute command
-                if !self.command_buffer.is_empty() {
-                    crate::terminal::print("\n");
-                    self.execute_command();
-                    self.command_buffer.clear();
-                    self.cursor_position = 0;
-                }
+                // Execute command (empty input just moves to a fresh line, so
+                // the prompt is never doubled)
+                crate::terminal::print("\n");
+                self.execute_command();
+                self.command_buffer.clear();
+                self.cursor_position = 0;
                 self.print_prompt();
             }
             '\x08' => { // Backspace
@@ -111,6 +110,7 @@ impl Shell {
             "cat" => self.cmd_with_required_path("cat", args, Self::cmd_cat),
             "mkdir" => self.cmd_with_required_path("mkdir", args, Self::cmd_mkdir),
             "rm" => self.cmd_with_required_path("rm", args, Self::cmd_rm),
+            "rmdir" => self.cmd_with_required_path("rmdir", args, Self::cmd_rmdir),
             "write" => self.cmd_write(args),
             "" => {}, // Empty command
             _ => {
@@ -176,7 +176,8 @@ impl Shell {
         crate::terminal::print("  cat      - Display file contents\n");
         crate::terminal::print("  mkdir    - Create directory\n");
         crate::terminal::print("  rm       - Remove file\n");
-        crate::terminal::print("  write    - Create file with content\n");
+        crate::terminal::print("  rmdir    - Remove an empty directory\n");
+        crate::terminal::print("  write    - Create file with content (overwrites existing file)\n");
     }
     
     fn cmd_clear(&self) {
@@ -257,12 +258,20 @@ impl Shell {
     
     // Filesystem commands
     fn cmd_ls(&self, path: &str) {
-        let files = crate::fs::list_directory(path);
-        if files.is_empty() {
-            crate::terminal::print("(empty directory)\n");
-        } else {
-            for file in files {
-                crate::terminal::print(&file);
+        match crate::fs::list_directory(path) {
+            Ok(files) => {
+                if files.is_empty() {
+                    crate::terminal::print("(empty directory)\n");
+                } else {
+                    for file in files {
+                        crate::terminal::print(&file);
+                        crate::terminal::print("\n");
+                    }
+                }
+            }
+            Err(e) => {
+                crate::terminal::print("ls: ");
+                crate::terminal::print(&e);
                 crate::terminal::print("\n");
             }
         }
@@ -332,11 +341,27 @@ impl Shell {
             crate::terminal::print("Usage: rm <filename>\n");
             return;
         }
-        
+
         match crate::fs::remove_file(filename) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 crate::terminal::print("rm: ");
+                crate::terminal::print(&e);
+                crate::terminal::print("\n");
+            }
+        }
+    }
+
+    fn cmd_rmdir(&self, dirname: &str) {
+        if dirname.is_empty() {
+            crate::terminal::print("Usage: rmdir <dirname>\n");
+            return;
+        }
+
+        match crate::fs::remove_directory(dirname) {
+            Ok(_) => {}
+            Err(e) => {
+                crate::terminal::print("rmdir: ");
                 crate::terminal::print(&e);
                 crate::terminal::print("\n");
             }
@@ -354,7 +379,7 @@ impl Shell {
         
         match crate::fs::create_file(filename, content.into_bytes()) {
             Ok(_) => {
-                crate::terminal::print("File created: ");
+                crate::terminal::print("File written: ");
                 crate::terminal::print(filename);
                 crate::terminal::print("\n");
             }

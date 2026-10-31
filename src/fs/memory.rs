@@ -1,6 +1,6 @@
 // Simple RAM-based filesystem implementation with trait
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::boxed::Box;
 use alloc::format;
@@ -102,39 +102,62 @@ impl MemoryFileSystem {
         None
     }
     
+    /// Normalize a path to canonical absolute form:
+    /// - absolute paths: resolved from the root
+    /// - relative paths: resolved against the current directory
+    /// - `.` and `..` components resolved (`..` cannot escape the root)
+    /// - duplicate and trailing `/` collapsed
     fn normalize_path(&self, path: &str) -> String {
-        if path.starts_with('/') {
-            // Absolute path
-            path.into()
+        let mut components: Vec<&str> = if path.starts_with('/') {
+            Vec::new()
         } else {
-            // Relative path
-            let mut result = self.current_dir.clone();
-            
-            let parts: Vec<&str> = path.split('/').collect();
-            for part in parts {
-                if part == "." || part.is_empty() {
-                    continue;
-                } else if part == ".." {
-                    // Go up one directory
-                    if result != "/" {
-                        let pos = result.rfind('/').unwrap_or(0);
-                        result = if pos == 0 { "/".into() } else { result[..pos].into() };
-                    }
-                } else {
-                    if !result.ends_with('/') {
-                        result.push('/');
-                    }
-                    result.push_str(part);
+            self.current_dir
+                .trim_start_matches('/')
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    components.pop();
                 }
+                name => components.push(name),
+            }
+        }
+
+        if components.is_empty() {
+            "/".into()
+        } else {
+            let mut result = String::new();
+            for component in components {
+                result.push('/');
+                result.push_str(component);
             }
             result
+        }
+    }
+
+    /// Split a normalized absolute path into (parent directory, last component).
+    fn split_last_component(normalized: &str) -> (&str, &str) {
+        match normalized.rfind('/') {
+            Some(0) => ("/", &normalized[1..]),
+            Some(pos) => (&normalized[..pos], &normalized[pos + 1..]),
+            None => ("/", normalized),
         }
     }
 }
 
 // Memory limits
-const MAX_FILE_SIZE: usize = 10 * 1024 * 1024; // 10MB limit
-const MAX_TOTAL_SIZE: usize = 100 * 1024 * 1024; // 100MB total limit
+// The kernel heap is a small static bump buffer (see src/allocator.rs) that
+// does not reclaim freed memory until every allocation is dropped, and
+// write_file briefly holds both the old and the new file data during an
+// overwrite. Cap files at 32 KiB so even that worst case stays well below
+// the heap size and a too-large write fails with an error before it can
+// exhaust the heap (OOM panic).
+const MAX_FILE_SIZE: usize = 32 * 1024; // 32 KiB
 
 impl FSTrait for MemoryFileSystem {
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, FileSystemError> {
@@ -162,16 +185,8 @@ impl FSTrait for MemoryFileSystem {
     
     fn create_file(&mut self, path: &str) -> Result<(), FileSystemError> {
         let normalized = self.normalize_path(path);
-        let (dir_path, filename) = if let Some(pos) = normalized.rfind('/') {
-            if pos == 0 {
-                ("/".to_string(), &normalized[1..])
-            } else {
-                (normalized[..pos].to_string(), &normalized[pos + 1..])
-            }
-        } else {
-            (self.current_dir.clone(), path)
-        };
-        
+        let (dir_path, filename) = Self::split_last_component(&normalized);
+
         if filename.is_empty() {
             return Err(FileSystemError::InvalidPath);
         }
@@ -192,38 +207,46 @@ impl FSTrait for MemoryFileSystem {
     
     fn delete_file(&mut self, path: &str) -> Result<(), FileSystemError> {
         let normalized = self.normalize_path(path);
-        let (dir_path, filename) = if let Some(pos) = normalized.rfind('/') {
-            if pos == 0 {
-                ("/".to_string(), &normalized[1..])
-            } else {
-                (normalized[..pos].to_string(), &normalized[pos + 1..])
-            }
-        } else {
-            (self.current_dir.clone(), path)
-        };
-        
+
+        if normalized == "/" {
+            return Err(FileSystemError::Custom(
+                "cannot remove '/' (it is a directory; use rmdir for directories)".into(),
+            ));
+        }
+
+        let (dir_path, filename) = Self::split_last_component(&normalized);
+
+        if filename.is_empty() {
+            return Err(FileSystemError::InvalidPath);
+        }
+
         let parent = self.find_entry(&dir_path).ok_or(FileSystemError::NotFound)?;
-        
-        let pos = parent.children.iter()
-            .position(|e| e.name == filename && matches!(e.file_type, FileType::Regular))
+
+        if !matches!(parent.file_type, FileType::Directory) {
+            return Err(FileSystemError::NotADirectory);
+        }
+
+        let pos = parent
+            .children
+            .iter()
+            .position(|e| e.name == filename)
             .ok_or(FileSystemError::NotFound)?;
-        
+
+        if matches!(parent.children[pos].file_type, FileType::Directory) {
+            return Err(FileSystemError::Custom(format!(
+                "'{}' is a directory (use rmdir to remove it)",
+                filename
+            )));
+        }
+
         parent.children.remove(pos);
         Ok(())
     }
     
     fn create_directory(&mut self, path: &str) -> Result<(), FileSystemError> {
         let normalized = self.normalize_path(path);
-        let (dir_path, dirname) = if let Some(pos) = normalized.rfind('/') {
-            if pos == 0 {
-                ("/".to_string(), &normalized[1..])
-            } else {
-                (normalized[..pos].to_string(), &normalized[pos + 1..])
-            }
-        } else {
-            (self.current_dir.clone(), path)
-        };
-        
+        let (dir_path, dirname) = Self::split_last_component(&normalized);
+
         if dirname.is_empty() {
             return Err(FileSystemError::InvalidPath);
         }
@@ -244,33 +267,47 @@ impl FSTrait for MemoryFileSystem {
     
     fn delete_directory(&mut self, path: &str) -> Result<(), FileSystemError> {
         let normalized = self.normalize_path(path);
-        
+
         // Don't allow deleting root
         if normalized == "/" {
             return Err(FileSystemError::PermissionDenied);
         }
-        
-        let (dir_path, dirname) = if let Some(pos) = normalized.rfind('/') {
-            if pos == 0 {
-                ("/".to_string(), &normalized[1..])
-            } else {
-                (normalized[..pos].to_string(), &normalized[pos + 1..])
-            }
-        } else {
-            (self.current_dir.clone(), path)
-        };
-        
-        let parent = self.find_entry(&dir_path).ok_or(FileSystemError::NotFound)?;
-        
-        let pos = parent.children.iter()
-            .position(|e| e.name == dirname && matches!(e.file_type, FileType::Directory))
-            .ok_or(FileSystemError::NotFound)?;
-        
-        // Check if directory is empty
-        if !parent.children[pos].children.is_empty() {
-            return Err(FileSystemError::Custom("Directory not empty".into()));
+
+        // Don't leave the current directory dangling
+        if normalized == self.current_dir {
+            return Err(FileSystemError::Custom(
+                "cannot remove the current directory".into(),
+            ));
         }
-        
+
+        let (dir_path, dirname) = Self::split_last_component(&normalized);
+
+        let parent = self.find_entry(&dir_path).ok_or(FileSystemError::NotFound)?;
+
+        if !matches!(parent.file_type, FileType::Directory) {
+            return Err(FileSystemError::NotADirectory);
+        }
+
+        let pos = parent
+            .children
+            .iter()
+            .position(|e| e.name == dirname)
+            .ok_or(FileSystemError::NotFound)?;
+
+        if !matches!(parent.children[pos].file_type, FileType::Directory) {
+            return Err(FileSystemError::Custom(format!(
+                "'{}' is not a directory (use rm to remove files)",
+                dirname
+            )));
+        }
+
+        if !parent.children[pos].children.is_empty() {
+            return Err(FileSystemError::Custom(format!(
+                "directory '{}' is not empty",
+                dirname
+            )));
+        }
+
         parent.children.remove(pos);
         Ok(())
     }
