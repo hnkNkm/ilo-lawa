@@ -1,5 +1,6 @@
 // Simple shell implementation for ilo-lawa OS
 
+use crate::keyboard::KeyEvent;
 use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -7,6 +8,7 @@ use lazy_static::lazy_static;
 
 const MAX_COMMAND_LENGTH: usize = 256;
 const HISTORY_SIZE: usize = 10;
+const PROMPT: &str = "ilo-lawa> ";
 
 lazy_static! {
     static ref SHELL: Mutex<Shell> = Mutex::new(Shell::new());
@@ -16,7 +18,17 @@ pub struct Shell {
     command_buffer: String,
     history: Vec<String>,
     history_index: usize,
+    /// Byte index into command_buffer where the next edit lands (commands
+    /// are ASCII, so bytes and chars coincide).
     cursor_position: usize,
+    /// What was being typed before the first Up recalled a history entry;
+    /// restored when Down moves past the newest entry.
+    draft: String,
+    /// Screen cells the last render of the input line occupied (prompt +
+    /// buffer), so a redraw clears exactly what is on screen.
+    rendered_cells: usize,
+    /// Terminal row where the current input line starts.
+    input_start_y: usize,
 }
 
 impl Shell {
@@ -26,53 +38,162 @@ impl Shell {
             history: Vec::with_capacity(HISTORY_SIZE),
             history_index: 0,
             cursor_position: 0,
+            draft: String::new(),
+            rendered_cells: 0,
+            input_start_y: 0,
         }
     }
-    
-    pub fn handle_key(&mut self, c: char) {
-        match c {
-            '\n' => {
-                // Execute command (empty input just moves to a fresh line, so
-                // the prompt is never doubled)
-                crate::terminal::print("\n");
-                self.execute_command();
-                self.command_buffer.clear();
-                self.cursor_position = 0;
-                self.print_prompt();
-            }
-            '\x08' => { // Backspace
+
+    /// Handle one decoded key event. Thread context only: every path below
+    /// takes the terminal lock, so this must never run inside an ISR.
+    pub fn handle_key_event(&mut self, event: KeyEvent) {
+        match event {
+            KeyEvent::Char(c) => self.handle_char(c),
+            KeyEvent::Enter => self.handle_enter(),
+            KeyEvent::Backspace => {
                 if self.cursor_position > 0 && !self.command_buffer.is_empty() {
                     self.cursor_position -= 1;
                     self.command_buffer.remove(self.cursor_position);
-                    // Redraw the entire line to handle backspace properly
-                    crate::terminal::print("\r");
-                    // Clear the entire line
-                    for _ in 0..80 {  // Clear 80 characters
-                        crate::terminal::print_char(' ');
-                    }
-                    crate::terminal::print("\r");
-                    // Reprint prompt and command buffer
-                    self.print_prompt();
-                    crate::terminal::print(&self.command_buffer);
+                    self.redraw_input();
                 }
             }
-            '\x7F' => { // Delete
+            KeyEvent::Delete => {
                 if self.cursor_position < self.command_buffer.len() {
                     self.command_buffer.remove(self.cursor_position);
-                    self.redraw_line();
+                    self.redraw_input();
                 }
             }
-            _ if c.is_ascii() && !c.is_control() => {
-                if self.command_buffer.len() < MAX_COMMAND_LENGTH {
-                    self.command_buffer.insert(self.cursor_position, c);
+            KeyEvent::Left => {
+                if self.cursor_position > 0 {
+                    self.cursor_position -= 1;
+                    self.redraw_input();
+                }
+            }
+            KeyEvent::Right => {
+                if self.cursor_position < self.command_buffer.len() {
                     self.cursor_position += 1;
-                    crate::terminal::print_char(c);
+                    self.redraw_input();
                 }
             }
-            _ => {} // Ignore other characters
+            KeyEvent::Home => {
+                self.cursor_position = 0;
+                self.redraw_input();
+            }
+            KeyEvent::End => {
+                self.cursor_position = self.command_buffer.len();
+                self.redraw_input();
+            }
+            KeyEvent::Up => self.history_previous(),
+            KeyEvent::Down => self.history_next(),
+            KeyEvent::CtrlC => {
+                crate::terminal::print("^C\n");
+                self.reset_input_line();
+                self.print_prompt();
+            }
+            KeyEvent::CtrlL => {
+                crate::terminal::clear();
+                self.print_prompt();
+                if !self.command_buffer.is_empty() {
+                    self.redraw_input();
+                }
+            }
         }
     }
-    
+
+    fn handle_char(&mut self, c: char) {
+        // ASCII-only semantics; control characters are ignored.
+        if !c.is_ascii() || c.is_control() {
+            return;
+        }
+        if self.command_buffer.len() >= MAX_COMMAND_LENGTH {
+            return;
+        }
+        self.command_buffer.insert(self.cursor_position, c);
+        self.cursor_position += 1;
+        if self.cursor_position == self.command_buffer.len() {
+            // Typed at the end of the line: just echo the character.
+            crate::terminal::print_char(c);
+            self.rendered_cells += 1;
+        } else {
+            // Inserted mid-line: redraw the shifted remainder.
+            self.redraw_input();
+        }
+    }
+
+    fn handle_enter(&mut self) {
+        // Execute command (empty input just moves to a fresh line, so the
+        // prompt is never doubled).
+        crate::terminal::print("\n");
+        self.execute_command();
+        self.reset_input_line();
+        self.print_prompt();
+    }
+
+    /// Clear the editing state and rewind history navigation (after a
+    /// command executed or Ctrl+C aborted the line).
+    fn reset_input_line(&mut self) {
+        self.command_buffer.clear();
+        self.cursor_position = 0;
+        self.draft.clear();
+        self.history_index = self.history.len();
+    }
+
+    fn history_previous(&mut self) {
+        if self.history.is_empty() || self.history_index == 0 {
+            return;
+        }
+        // Leaving the fresh line: remember what was being typed so Down can
+        // restore it when navigating back past the newest entry.
+        if self.history_index == self.history.len() {
+            self.draft = self.command_buffer.clone();
+        }
+        self.history_index -= 1;
+        self.recall_history_entry();
+    }
+
+    fn history_next(&mut self) {
+        if self.history_index >= self.history.len() {
+            return; // Already at the fresh-line position.
+        }
+        self.history_index += 1;
+        if self.history_index == self.history.len() {
+            // Past the newest entry: restore the draft (empty when the
+            // first Up started from a fresh line).
+            let draft = core::mem::take(&mut self.draft);
+            self.set_buffer(draft);
+        } else {
+            self.recall_history_entry();
+        }
+    }
+
+    fn recall_history_entry(&mut self) {
+        let entry = self.history[self.history_index].clone();
+        self.set_buffer(entry);
+    }
+
+    /// Replace the buffer with `s` and put the cursor at its end.
+    fn set_buffer(&mut self, s: String) {
+        self.command_buffer = s;
+        self.cursor_position = self.command_buffer.len();
+        self.redraw_input();
+    }
+
+    /// Redraw the input line in place and remember how many screen cells
+    /// the render occupies. The framebuffer is updated without ANSI
+    /// escapes; the serial mirror does not see redraws.
+    fn redraw_input(&mut self) {
+        let start_y = self.input_start_y;
+        let previous_cells = self.rendered_cells;
+        crate::terminal::redraw_input(
+            PROMPT,
+            &self.command_buffer,
+            self.cursor_position,
+            start_y,
+            previous_cells,
+        );
+        self.rendered_cells = PROMPT.len() + self.command_buffer.len();
+    }
+
     fn execute_command(&mut self) {
         let command = self.command_buffer.trim();
         
@@ -141,21 +262,12 @@ impl Shell {
         }
     }
     
-    fn print_prompt(&self) {
-        crate::terminal::print("ilo-lawa> ");
-    }
-    
-    fn redraw_line(&self) {
-        // Move cursor back and reprint the line
-        crate::terminal::print("\r");
-        // Clear the line with spaces
-        for _ in 0..(10 + self.command_buffer.len()) {
-            crate::terminal::print_char(' ');
-        }
-        crate::terminal::print("\r");
-        // Reprint prompt and buffer
-        self.print_prompt();
-        crate::terminal::print(&self.command_buffer);
+    fn print_prompt(&mut self) {
+        // Record where the input line starts and reset the rendered-cells
+        // count so later redraws clear exactly what is on screen.
+        self.input_start_y = crate::terminal::cursor_y();
+        self.rendered_cells = PROMPT.len();
+        crate::terminal::print(PROMPT);
     }
     
     // Built-in commands
@@ -465,6 +577,6 @@ pub fn init() {
     SHELL.lock().print_prompt();
 }
 
-pub fn handle_input(c: char) {
-    SHELL.lock().handle_key(c);
+pub fn handle_key_event(event: KeyEvent) {
+    SHELL.lock().handle_key_event(event);
 }

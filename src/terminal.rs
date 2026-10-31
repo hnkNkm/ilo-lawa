@@ -84,6 +84,62 @@ impl Terminal {
         let y = self.cursor_y * (CHAR_HEIGHT + LINE_SPACING);
         self.gfx.draw_char(x, y, c, self.fg_color, Some(self.bg_color));
     }
+
+    /// Move the text cursor to cell (x, y) without touching the
+    /// framebuffer. Caller must ensure y < self.rows.
+    fn set_cursor(&mut self, x: usize, y: usize) {
+        self.cursor_x = x;
+        self.cursor_y = y;
+    }
+
+    /// Redraw an input line (prompt + editable buffer) in place without
+    /// ANSI escapes: clear `max(previous_cells, prompt.len() +
+    /// buffer.len())` cells starting at column 0 of `start_y` by writing
+    /// spaces through `write_char` (so wrapping behaves exactly like
+    /// normal text), move back to (0, start_y), redraw prompt + buffer,
+    /// then park the cursor at buffer offset `cursor_pos`.
+    ///
+    /// Thread context only. If output scrolled since the line started and
+    /// `start_y` is no longer on screen, it is clamped to the last row
+    /// rather than corrupting the screen. Limitation: a line long enough
+    /// to wrap past the final row can still scroll during the redraw.
+    fn redraw_input(
+        &mut self,
+        prompt: &str,
+        buffer: &str,
+        cursor_pos: usize,
+        start_y: usize,
+        previous_cells: usize,
+    ) {
+        // Degenerate framebuffer (zero-width or zero-height GOP mode):
+        // there is nothing to draw and the cursor row/col math below
+        // would divide by zero, so do nothing.
+        if self.cols == 0 || self.rows == 0 {
+            return;
+        }
+        let start_y = start_y.min(self.rows - 1);
+        let cells = previous_cells.max(prompt.len() + buffer.len());
+
+        // Clear whatever the previous render left on those cells.
+        self.set_cursor(0, start_y);
+        for _ in 0..cells {
+            self.write_char(' ');
+        }
+
+        // Redraw prompt and buffer from the start of the line.
+        self.set_cursor(0, start_y);
+        for c in prompt.chars() {
+            self.write_char(c);
+        }
+        for c in buffer.chars() {
+            self.write_char(c);
+        }
+
+        // Position the logical cursor inside the buffer.
+        let offset = prompt.len() + cursor_pos;
+        let row = start_y + offset / self.cols;
+        self.set_cursor(offset % self.cols, row.min(self.rows.saturating_sub(1)));
+    }
     
     fn newline(&mut self) {
         self.cursor_x = 0;
@@ -184,5 +240,30 @@ pub fn print(s: &str) {
 pub fn clear() {
     if let Some(ref mut terminal) = *TERMINAL.lock() {
         terminal.clear_screen();
+    }
+}
+
+/// Current text row of the terminal cursor (0-based). 0 before init().
+/// Thread context only (takes the terminal lock).
+pub fn cursor_y() -> usize {
+    match &*TERMINAL.lock() {
+        Some(terminal) => terminal.cursor_y,
+        None => 0,
+    }
+}
+
+/// Redraw the shell input line in place. See [`Terminal::redraw_input`] for
+/// the semantics; thread context only (takes the terminal lock). Redraws
+/// are not mirrored to serial — the framebuffer is the source of truth for
+/// the edited line.
+pub fn redraw_input(
+    prompt: &str,
+    buffer: &str,
+    cursor_pos: usize,
+    start_y: usize,
+    previous_cells: usize,
+) {
+    if let Some(terminal) = &mut *TERMINAL.lock() {
+        terminal.redraw_input(prompt, buffer, cursor_pos, start_y, previous_cells);
     }
 }
