@@ -135,8 +135,12 @@ pub fn init(fb_info: FramebufferInfo) {
     *TERMINAL.lock() = Some(terminal);
 }
 
+// All console output is mirrored to COM1. The serial lock is taken and
+// released BEFORE the terminal lock (sequential, never nested), and
+// serial-first so output emitted before init() still reaches the host.
 pub fn print_fmt(args: core::fmt::Arguments) {
     use core::fmt::Write;
+    crate::serial::print_fmt(args);
     if let Some(ref mut terminal) = *TERMINAL.lock() {
         let _ = terminal.write_fmt(args);
     }
@@ -150,12 +154,14 @@ pub unsafe fn force_unlock() {
 }
 
 pub fn print_char(c: char) {
+    crate::serial::print_char(c);
     if let Some(ref mut terminal) = *TERMINAL.lock() {
         terminal.write_char(c);
     }
 }
 
 pub fn print(s: &str) {
+    crate::serial::print(s);
     if let Some(ref mut terminal) = *TERMINAL.lock() {
         terminal.write_string(s);
     }

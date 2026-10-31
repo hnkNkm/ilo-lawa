@@ -23,6 +23,23 @@ lazy_static! {
             .set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_usize()]
             .set_handler_fn(keyboard_interrupt_handler);
+
+        // Every PIC vector needs a present entry: spurious IRQ7/IRQ15 fire
+        // even when masked, and a non-present gate would fault (issue #6)
+        idt[34].set_handler_fn(irq2_handler);
+        idt[35].set_handler_fn(irq3_handler);
+        idt[36].set_handler_fn(irq4_handler);
+        idt[37].set_handler_fn(irq5_handler);
+        idt[38].set_handler_fn(irq6_handler);
+        idt[39].set_handler_fn(spurious_irq7_handler);
+        idt[40].set_handler_fn(irq8_handler);
+        idt[41].set_handler_fn(irq9_handler);
+        idt[42].set_handler_fn(irq10_handler);
+        idt[43].set_handler_fn(irq11_handler);
+        idt[44].set_handler_fn(irq12_handler);
+        idt[45].set_handler_fn(irq13_handler);
+        idt[46].set_handler_fn(irq14_handler);
+        idt[47].set_handler_fn(spurious_irq15_handler);
         idt
     };
 }
@@ -99,6 +116,59 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     
     unsafe {
         pic::PICS.lock().notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
+}
+
+// extern "x86-interrupt" fns cannot be generic, so expand a concrete fn
+// per vector. Handlers must only ack the PIC (see concurrency rules).
+macro_rules! pic_eoi_handlers {
+    ($($name:ident => $vector:expr),+ $(,)?) => {
+        $(
+            extern "x86-interrupt" fn $name(_stack_frame: InterruptStackFrame) {
+                unsafe {
+                    pic::PICS.lock().notify_end_of_interrupt($vector);
+                }
+            }
+        )+
+    };
+}
+
+pic_eoi_handlers! {
+    irq2_handler => 34,
+    irq3_handler => 35,
+    irq4_handler => 36,
+    irq5_handler => 37,
+    irq6_handler => 38,
+    irq8_handler => 40,
+    irq9_handler => 41,
+    irq10_handler => 42,
+    irq11_handler => 43,
+    irq12_handler => 44,
+    irq13_handler => 45,
+    irq14_handler => 46,
+}
+
+extern "x86-interrupt" fn spurious_irq7_handler(_stack_frame: InterruptStackFrame) {
+    unsafe {
+        let mut pics = pic::PICS.lock();
+        // Spurious IRQ7: master ISR bit 7 clear means nothing is actually
+        // in service, so no EOI must be sent
+        if pics.read_isr() & (1 << 7) != 0 {
+            pics.notify_end_of_interrupt(39);
+        }
+    }
+}
+
+extern "x86-interrupt" fn spurious_irq15_handler(_stack_frame: InterruptStackFrame) {
+    unsafe {
+        let mut pics = pic::PICS.lock();
+        // Spurious IRQ15: slave ISR bit 7 (bit 15 here) clear, but the
+        // master's cascade IRQ2 was in service, so EOI the master only
+        if pics.read_isr() & (1 << 15) != 0 {
+            pics.notify_end_of_interrupt(47);
+        } else {
+            pics.notify_end_of_interrupt_master();
+        }
     }
 }
 
