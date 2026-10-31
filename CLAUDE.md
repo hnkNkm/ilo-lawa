@@ -19,6 +19,9 @@ make run
 # Run in QEMU (macOS / no KVM)
 make run-no-kvm
 
+# Build with the test harness and run it headless in QEMU (exit 33 = pass)
+make test
+
 # Clean build artifacts (also removes esp/ and ovmf/)
 make clean
 
@@ -29,14 +32,15 @@ nix develop --impure
 Notes:
 - `.cargo/config.toml` sets the default target to `x86_64-unknown-uefi` and enables `build-std` for `core`, `compiler_builtins`, and `alloc` — plain `cargo build` works inside the Nix shell without extra flags.
 - `make run` copies the `.efi` to `esp/efi/boot/bootx64.efi` and boots QEMU with OVMF firmware (auto-downloaded to `ovmf/` on first run).
-- There are no automated tests; verification is done by booting in QEMU and exercising the shell. The console is mirrored to COM1, so the serial output (`-serial stdio` in the Makefile, or `-serial file:...` headless) contains the full boot log and shell session as plain text.
+- `make test` is the automated test path: it builds with `--features test-harness` into a separate `target-test/` dir (so `make build`'s cache is untouched), boots headless QEMU with `-device isa-debug-exit,iobase=0xf4,iosize=0x04`, and maps the exit code — 33 (harness wrote 0x10) is pass; anything else (35 = harness reported failures, 124 = timeout, panic/hang) is failure. The full serial log lands in `test-serial.log` (gitignored).
+- Without the feature there are no automated tests; verification is done by booting in QEMU and exercising the shell. The console is mirrored to COM1, so the serial output (`-serial stdio` in the Makefile, or `-serial file:...` headless) contains the full boot log and shell session as plain text.
 - Requires nightly Rust (provided by the Nix flake) for `#![feature(abi_x86_interrupt)]` and `#![feature(alloc_error_handler)]`.
 
 ## Architecture Overview
 
 ### Boot Process Flow
 1. **UEFI Entry** (`src/main.rs`): Captures framebuffer info from GOP, then calls `ExitBootServices()`. After this point no UEFI services exist.
-2. **Kernel Entry** (`src/kernel.rs:kernel_main`): Disables interrupts, then initializes in strict order: terminal → heap allocator → CPU features (FPU/SSE) → GDT → IDT → PIC → memory map + frame allocator → filesystem → PIT timer (100 Hz) → enable interrupts → shell. Filesystem init must stay before interrupt enable so no IRQ can arrive while its locks are held; the PIT is programmed after the PIC (IRQ0 routed) and before interrupts are enabled.
+2. **Kernel Entry** (`src/kernel.rs:kernel_main`): Disables interrupts, then initializes in strict order: terminal → heap allocator → CPU features (FPU/SSE) → GDT → IDT → PIC → memory map + frame allocator → filesystem → PIT timer (100 Hz) → enable interrupts → shell. Filesystem init must stay before interrupt enable so no IRQ can arrive while its locks are held; the PIT is programmed after the PIC (IRQ0 routed) and before interrupts are enabled. Test builds only (feature `test-harness`): after the filesystem and PIT are up, `test_harness::run()` executes the kernel self-tests and exits QEMU via isa-debug-exit before interrupts are ever enabled — the shell and main loop are not reached.
 3. **Runtime**: The keyboard ISR only enqueues raw scancodes (`keyboard::add_scancode` → `SCANCODE_QUEUE`). The main loop in `kernel_main` drains the queue in thread context (`try_pop_scancode` with interrupts disabled, `enable_and_hlt` when empty) and dispatches: scancode → ASCII → `shell::handle_input` → command execution.
 
 ### Critical Components
@@ -70,6 +74,11 @@ Notes:
 - `src/shell.rs`: Command parsing, history (10 entries), built-ins (help, echo, version, uptime, sleep, reboot, ...) and filesystem commands (ls, cd, pwd, cat, mkdir, rm, write). Global singleton behind `spin::Mutex` — command handlers run in the kernel main loop (thread context), fed one character at a time from the scancode queue.
 - `src/terminal.rs`: Framebuffer text terminal (8x8 font from `src/font.rs`, direct pixel writes). Scrolling shifts the framebuffer up one text row (10 px) via `KernelGraphics::scroll_up` memmove and clears only the exposed bottom row.
 - `src/keyboard.rs`: Scancode set 1 → ASCII, tracks Shift/Ctrl state.
+
+**Test Harness** (`src/test_harness.rs`, cargo feature `test-harness`, issue #13):
+- Only compiled with `--features test-harness` (`make test`); normal builds are unchanged. In test builds `kernel_main` calls `test_harness::run()` right after `fs::init()` and BEFORE `interrupts::enable()`, so the harness never touches the shell, the scancode queue, or any IRQ path, and runs with interrupts still disabled.
+- Five deterministic tests: heap churn (allocate/verify/drop `Vec`s and `String`s of varied sizes over the linked-list heap), frame-allocator invariants (3 frames: 4 KiB alignment, distinct, < 4 GiB, free count restored), FS CRUD (create/read/overwrite/delete `/harness.txt`, mkdir/rmdir lifecycle incl. non-empty rmdir rejection), path normalization (`cd` with `..`, `//`, trailing `/`, `..` past root; rmdir of the cwd rejected), and error formatting (missing paths give non-empty messages naming the path). Each test prints `[PASS]`/`[FAIL]` (mirrored to COM1) and returns a `Result` so one failure doesn't halt the rest; no `assert!` panics, no keyboard/QMP dependency.
+- Exit path: writes 0x10 (pass) or 0x11 (fail) to isa-debug-exit port 0xF4 → QEMU exit `(value << 1) | 1` = 33 or 35; `make test` treats 33 as success and everything else (including 60 s timeout) as failure.
 
 ### Module Dependencies & Conventions
 - All interrupt handlers must use `extern "x86-interrupt"` ABI

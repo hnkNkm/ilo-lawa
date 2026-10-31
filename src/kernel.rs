@@ -122,6 +122,9 @@ impl KernelGraphics {
 
 // The actual kernel entry point after ExitBootServices. The UEFI memory
 // map is retained here (see memory::init) rather than discarded.
+// `unreachable_code`: with feature `test-harness` the harness call below
+// diverges, so the remainder of the init sequence is unreachable there.
+#[allow(unreachable_code)]
 pub fn kernel_main(fb_info: FramebufferInfo, memory_map: uefi::table::boot::MemoryMap<'static>) -> ! {
     // CRITICAL: Disable interrupts immediately after ExitBootServices
     x86_64::instructions::interrupts::disable();
@@ -182,6 +185,13 @@ pub fn kernel_main(fb_info: FramebufferInfo, memory_map: uefi::table::boot::Memo
     crate::terminal::print("Initializing PIT timer (100 Hz)...");
     crate::time::init();
     crate::terminal::print(" [OK]\n");
+
+    // Test harness (feature "test-harness"): with the filesystem and PIT
+    // up and interrupts still disabled, run the kernel self-tests and exit
+    // QEMU through isa-debug-exit before interrupts, shell, or the main
+    // loop ever start.
+    #[cfg(feature = "test-harness")]
+    crate::test_harness::run();
 
     crate::terminal::print("\nInterrupt system ready.\n");
     crate::terminal::print("Enabling interrupts...");

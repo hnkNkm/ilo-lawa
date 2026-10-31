@@ -11,6 +11,11 @@ lazy_static = { version = "1.4", features = ["spin_no_std"] }
 spin = "0.9"
 linked_list_allocator = "0.10"
 
+[features]
+# In-kernel test harness (src/test_harness.rs): runs self-tests after init
+# and exits QEMU via isa-debug-exit. Off by default; normal builds unchanged.
+test-harness = []
+
 [profile.dev]
 panic = "abort"
 

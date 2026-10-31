@@ -22,6 +22,8 @@ mod allocator;
 mod shell;
 mod fs;
 mod memory;
+#[cfg(feature = "test-harness")]
+mod test_harness;
 
 use kernel::{FramebufferInfo, kernel_main};
 use core::panic::PanicInfo;

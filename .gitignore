@@ -14,6 +14,10 @@ Cargo.lock
 /result-*
 /.direnv/
 
+# Test harness artifacts (make test)
+/test-serial.log
+/target-test/
+
 # IDE
 .vscode/
 .idea/
