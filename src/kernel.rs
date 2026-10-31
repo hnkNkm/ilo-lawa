@@ -137,7 +137,7 @@ pub fn kernel_main(fb_info: FramebufferInfo, memory_map: uefi::table::boot::Memo
     crate::terminal::init(fb_info);
     
     // Clear screen and show boot messages
-    crate::terminal::print("ilo-lawa OS v0.4.0\n");
+    crate::terminal::print(concat!("ilo-lawa OS v", env!("CARGO_PKG_VERSION"), "\n"));
     crate::terminal::print("===================\n\n");
     crate::terminal::print("System Initialization:\n");
     crate::terminal::print("[OK] Interrupts disabled\n");

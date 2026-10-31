@@ -12,9 +12,7 @@ use alloc::format;
 pub enum FileSystemError {
     NotFound,
     PermissionDenied,
-    DiskFull,
     InvalidPath,
-    IoError,
     NotImplemented,
     AlreadyExists,
     NotADirectory,
@@ -33,9 +31,7 @@ impl core::fmt::Display for FileSystemError {
         match self {
             FileSystemError::NotFound => write!(f, "No such file or directory"),
             FileSystemError::PermissionDenied => write!(f, "Permission denied"),
-            FileSystemError::DiskFull => write!(f, "No space left on device"),
             FileSystemError::InvalidPath => write!(f, "Invalid path"),
-            FileSystemError::IoError => write!(f, "I/O error"),
             FileSystemError::NotImplemented => write!(f, "Not implemented"),
             FileSystemError::AlreadyExists => write!(f, "File or directory already exists"),
             FileSystemError::NotADirectory => write!(f, "Not a directory"),
@@ -66,7 +62,6 @@ pub trait FileSystem: Send + Sync {
     fn create_directory(&mut self, path: &str) -> Result<(), FileSystemError>;
     fn delete_directory(&mut self, path: &str) -> Result<(), FileSystemError>;
     fn list_directory(&mut self, path: &str) -> Result<Vec<DirEntry>, FileSystemError>;
-    fn exists(&mut self, path: &str) -> bool;
     fn is_directory(&mut self, path: &str) -> bool;
     fn is_file(&mut self, path: &str) -> bool;
     fn get_current_directory(&self) -> String;

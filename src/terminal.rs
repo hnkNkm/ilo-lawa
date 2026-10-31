@@ -75,10 +75,8 @@ impl Terminal {
             }
         }
         
-        // Draw cursor (temporarily disabled for debugging)
-        // self.draw_cursor();
     }
-    
+
     fn draw_char_at_cursor(&mut self, c: char) {
         let x = self.cursor_x * CHAR_WIDTH;
         let y = self.cursor_y * (CHAR_HEIGHT + LINE_SPACING);
@@ -160,13 +158,6 @@ impl Terminal {
         // Shift the framebuffer up by one text row and clear only the newly
         // exposed bottom row, keeping earlier output readable.
         self.gfx.scroll_up(CHAR_HEIGHT + LINE_SPACING, self.bg_color);
-    }
-    
-    fn draw_cursor(&mut self) {
-        // Draw a blinking cursor (for now just a solid block)
-        let x = self.cursor_x * CHAR_WIDTH;
-        let y = self.cursor_y * (CHAR_HEIGHT + LINE_SPACING);
-        self.gfx.draw_rect(x, y, CHAR_WIDTH, CHAR_HEIGHT, 0x808080);
     }
     
     pub fn write_string(&mut self, s: &str) {
