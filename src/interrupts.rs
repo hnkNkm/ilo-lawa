@@ -48,8 +48,12 @@ pub fn init() {
     IDT.load();
 }
 
+// Exception handlers must not spin on the console locks: the fault may
+// have interrupted code that holds them (issue #17). Fatal exceptions
+// panic! directly — the panic handler force-unlocks before printing.
+// The resumable breakpoint handler uses best-effort try_print instead.
 extern "x86-interrupt" fn breakpoint_handler(_stack_frame: InterruptStackFrame) {
-    crate::terminal::print("EXCEPTION: BREAKPOINT\n");
+    crate::terminal::try_print("EXCEPTION: BREAKPOINT\n");
 }
 
 extern "x86-interrupt" fn double_fault_handler(
@@ -64,36 +68,27 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: x86_64::structures::idt::PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
-    
-    crate::terminal::print("EXCEPTION: PAGE FAULT\n");
-    crate::terminal::print("Accessed Address: ");
-    let addr = Cr2::read();
-    // Simple hex print
-    crate::terminal::print("0x");
-    for i in (0..16).rev() {
-        let nibble = ((addr.as_u64() >> (i * 4)) & 0xF) as u8;
-        let c = if nibble < 10 {
-            ('0' as u8 + nibble) as char
-        } else {
-            ('A' as u8 + nibble - 10) as char
-        };
-        crate::terminal::print_char(c);
-    }
-    crate::terminal::print("\n");
-    panic!("Page fault at {:#?}\n{:#?}", addr, stack_frame);
+
+    panic!(
+        "EXCEPTION: PAGE FAULT at {:?} ({:?})\n{:#?}",
+        Cr2::read(),
+        error_code,
+        stack_frame
+    );
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) {
-    crate::terminal::print("EXCEPTION: GENERAL PROTECTION FAULT\n");
-    panic!("General Protection Fault (error code: {})\n{:#?}", error_code, stack_frame);
+    panic!(
+        "EXCEPTION: GENERAL PROTECTION FAULT (error code: {})\n{:#?}",
+        error_code, stack_frame
+    );
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
-    crate::terminal::print("EXCEPTION: INVALID OPCODE\n");
-    panic!("Invalid Opcode\n{:#?}", stack_frame);
+    panic!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {

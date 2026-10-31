@@ -146,6 +146,17 @@ pub fn print_fmt(args: core::fmt::Arguments) {
     }
 }
 
+/// Best-effort print for exception context: never spins on the console
+/// locks (the interrupted code may hold them), so output may be skipped.
+pub fn try_print(s: &str) {
+    crate::serial::try_print(s);
+    if let Some(mut guard) = TERMINAL.try_lock() {
+        if let Some(ref mut terminal) = *guard {
+            terminal.write_string(s);
+        }
+    }
+}
+
 /// Recover the terminal lock on the panic path: the interrupted context may
 /// still hold it and will never resume. Only safe to call with interrupts
 /// disabled and when the lock holder cannot run again.
