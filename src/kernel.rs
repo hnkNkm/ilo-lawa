@@ -98,6 +98,15 @@ pub struct ImageInfo {
     pub size: u64,
 }
 
+// ACPI RSDP physical address captured from the UEFI configuration table
+// BEFORE ExitBootServices (0 = firmware published no ACPI tables). Tables
+// are identity-mapped after paging::init, so acpi::init can parse them
+// from this bare physical address with no heap.
+#[derive(Clone, Copy)]
+pub struct AcpiInfo {
+    pub rsdp_addr: u64,
+}
+
 // Simple kernel graphics driver
 pub struct KernelGraphics {
     fb_info: FramebufferInfo,
@@ -221,6 +230,7 @@ struct BootArgs {
     fb_info: FramebufferInfo,
     memory_map: uefi::table::boot::MemoryMap<'static>,
     image: ImageInfo,
+    acpi: AcpiInfo,
 }
 
 static BOOT_ARGS: Once<BootArgs> = Once::new();
@@ -235,6 +245,7 @@ pub fn kernel_main(
     fb_info: FramebufferInfo,
     memory_map: uefi::table::boot::MemoryMap<'static>,
     image: ImageInfo,
+    acpi: AcpiInfo,
 ) -> ! {
     // CRITICAL: Disable interrupts immediately after ExitBootServices
     x86_64::instructions::interrupts::disable();
@@ -245,7 +256,7 @@ pub fn kernel_main(
 
     // Park the boot arguments, then leave the firmware stack for good.
     let firmware_rsp = crate::stacks::current_stack_pointer();
-    BOOT_ARGS.call_once(|| BootArgs { fb_info, memory_map, image });
+    BOOT_ARGS.call_once(|| BootArgs { fb_info, memory_map, image, acpi });
     let kernel_top = crate::stacks::main_stack_top();
     crate::serial::print_fmt(format_args!(
         "[stack] firmware rsp={:#x} -> kernel-owned stack top={:#x}, switching\n",
@@ -289,6 +300,14 @@ pub extern "C" fn kernel_main_owned() -> ! {
     // allocates or maps memory (see src/paging.rs).
     crate::terminal::print("Installing kernel page tables...");
     crate::paging::init(fb_info, &args.memory_map, args.image);
+    crate::terminal::print(" [OK]\n");
+
+    // Parse the ACPI RSDP -> RSDT/XSDT -> FADT chain for shutdown/reboot.
+    // The tables are identity-mapped by paging::init, so this needs no
+    // heap and runs before the allocator exists; a malformed table only
+    // disables ACPI power control (halt/8042 fallbacks stay available).
+    crate::terminal::print("Initializing ACPI (RSDP/FADT)...");
+    crate::acpi::init(args.acpi.rsdp_addr);
     crate::terminal::print(" [OK]\n");
 
     // Retain the UEFI memory map and bring up the physical frame
