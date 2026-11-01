@@ -168,7 +168,7 @@ pub fn kernel_main(fb_info: FramebufferInfo, memory_map: uefi::table::boot::Memo
 // `unreachable_code`: with feature `test-harness` the harness call below
 // diverges, so the remainder of the init sequence is unreachable there.
 #[allow(unreachable_code)]
-pub fn kernel_main_owned() -> ! {
+pub extern "C" fn kernel_main_owned() -> ! {
     let args = BOOT_ARGS
         .get()
         .expect("boot args must be parked before the stack switch");
