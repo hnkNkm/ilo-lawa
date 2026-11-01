@@ -388,24 +388,15 @@ impl Shell {
     
     fn cmd_shutdown(&self) {
         crate::terminal::print("Shutting down...\n");
-        // TODO: Proper shutdown sequence
-        loop {
-            x86_64::instructions::hlt();
-        }
+        // ACPI S5 power-off (see src/acpi.rs); halts when no usable FADT.
+        crate::acpi::shutdown();
     }
     
     fn cmd_reboot(&self) {
         crate::terminal::print("Rebooting...\n");
-        // Trigger a reboot via the keyboard controller
-        use x86_64::instructions::port::Port;
-        unsafe {
-            let mut port = Port::new(0x64);
-            port.write(0xFEu8);
-        }
-        // If that doesn't work, just halt
-        loop {
-            x86_64::instructions::hlt();
-        }
+        // FADT reset register, then the 8042 keyboard controller (see
+        // src/acpi.rs); halts when both fail.
+        crate::acpi::reboot();
     }
     
     // Filesystem commands

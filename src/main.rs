@@ -24,6 +24,7 @@ mod shell;
 mod fs;
 mod memory;
 mod paging;
+mod acpi;
 mod stacks;
 #[cfg(feature = "test-harness")]
 mod test_harness;
@@ -128,6 +129,31 @@ fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         }
     };
 
+    // ACPI RSDP physical address, captured BEFORE ExitBootServices: the
+    // UEFI configuration table disappears with boot services. Prefer the
+    // ACPI 2.0+ entry (XSDT-capable RSDP), fall back to the ACPI 1.0 one;
+    // 0 when the firmware publishes no ACPI tables (acpi::init then just
+    // disables power control).
+    let acpi_info = {
+        use uefi::table::cfg;
+        let mut rsdp_addr: u64 = 0;
+        for entry in system_table.config_table() {
+            if entry.guid == cfg::ACPI2_GUID {
+                rsdp_addr = entry.address as u64;
+                break;
+            }
+        }
+        if rsdp_addr == 0 {
+            for entry in system_table.config_table() {
+                if entry.guid == cfg::ACPI_GUID {
+                    rsdp_addr = entry.address as u64;
+                    break;
+                }
+            }
+        }
+        kernel::AcpiInfo { rsdp_addr }
+    };
+
     system_table
         .stdout()
         .output_string(cstr16!("Calling ExitBootServices...\r\n"))
@@ -141,7 +167,7 @@ fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
     // WE ARE NOW IN KERNEL MODE!
     // No more UEFI services, we're on our own
-    kernel_main(fb_info, memory_map, image_info);
+    kernel_main(fb_info, memory_map, image_info, acpi_info);
 }
 
 #[panic_handler]
