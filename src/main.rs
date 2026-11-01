@@ -22,6 +22,7 @@ mod allocator;
 mod shell;
 mod fs;
 mod memory;
+mod stacks;
 #[cfg(feature = "test-harness")]
 mod test_harness;
 
