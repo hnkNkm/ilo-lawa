@@ -2,8 +2,8 @@
 //!
 //! After ExitBootServices the kernel still runs on the firmware's page
 //! tables. [`init`] replaces them with a static table set built in .bss:
-//! one PML4, one PDPT and four page directories identity-map the low 4 GiB
-//! with 2 MiB pages — every virtual address stays equal to its physical
+//! one PML4, one PDPT and six page directories identity-map 0..6 GiB with
+//! 2 MiB pages — every virtual address stays equal to its physical
 //! address, so the framebuffer, the retained UEFI memory map, the firmware's
 //! leftovers and the kernel image itself all keep working across the CR3
 //! switch.
@@ -22,7 +22,9 @@
 //! heap exists and never consumes a frame: the tables are the `.bss`
 //! statics themselves.
 //!
-//! All memory touched here is below 4 GiB, matching
+//! All memory the kernel actually touches sits below 4 GiB (OVMF relocates
+//! the image into low RAM — boot logs show CR3 ≈ 0x1d4ba000, not the PE
+//! preferred base); the frame allocator pool is bounded by
 //! `memory::MAX_SUPPORTED_PHYS`. Interrupts are disabled throughout, so the
 //! firmware map and this map are never mixed on the CPU.
 
@@ -35,14 +37,13 @@ use x86_64::PhysAddr;
 
 use crate::kernel::FramebufferInfo;
 
-/// One page directory covers 1 GiB with 2 MiB pages. Six cover 0..6 GiB:
-/// four for the RAM window (`memory::MAX_SUPPORTED_PHYS`), plus PDPT[5]
-/// for 5..6 GiB because the kernel image itself is loaded at the PE
-/// preferred base 0x140000000 (5 GiB) — .text/.data/.bss, including these
-/// page tables, the stack regions and the heap, live there. All of it hangs
-/// under PML4[0]. Stage 2b will narrow the mapping to the exact image
-/// bounds via LoadedImage; the flat 1 GiB window is correct for every
-/// layout the uefi target produces (default image base).
+/// One page directory covers 1 GiB with 2 MiB pages; six cover 0..6 GiB,
+/// all under PML4[0]. Four would bound the RAM/frame-allocator window
+/// (`memory::MAX_SUPPORTED_PHYS` = 4 GiB); the extra two are defensive
+/// headroom for firmware that loads the kernel image at (or near) the PE
+/// preferred base 0x140000000 = 5 GiB instead of relocating it low like
+/// OVMF does. Stage 2b will narrow the map to the exact image bounds via
+/// LoadedImage.
 const PD_COUNT: usize = 6;
 const HUGE_PAGE: u64 = 1 << 21;
 const PDE_COUNT: usize = 512 * PD_COUNT;
@@ -93,7 +94,9 @@ fn pd_ptr(pdpt_idx: usize) -> *mut PageTable {
     unsafe { &raw mut PDS[pdpt_idx].0 }
 }
 
-/// PDE location and 2 MiB base for a physical address below 4 GiB.
+/// PDE location and 2 MiB base for a physical address inside the mapped
+/// 0..6 GiB window (`pde_for` results index `PDS` and must stay below
+/// `PD_COUNT`).
 fn pde_for(pa: u64) -> (usize, usize, u64) {
     let pdpt_idx = (pa >> 30) as usize & 0x1FF;
     let pde_idx = (pa >> 21) as usize & 0x1FF;
@@ -154,14 +157,39 @@ pub fn init(fb_info: FramebufferInfo, memory_map: &MemoryMap<'static>) {
     // Framebuffer: PWT|PCD on every 2 MiB PDE it touches (MMIO bypasses the
     // caches). Warn if such a PDE overlaps CONVENTIONAL RAM — under QEMU's
     // layout it never does; the warning means the UC flags are eating RAM.
+    // Defensive bounds: an unusual GOP bar or size must never push pde_for
+    // past the mapped window (it would index PDS out of range) — log and
+    // limit/skip the UC marking instead.
+    let map_limit = (PD_COUNT as u64) << 30;
     let fb_base = fb_info.base_address;
     let fb_len = fb_info.stride as u64 * fb_info.height as u64 * 4;
     let fb_start = fb_base & !(HUGE_PAGE - 1);
-    let fb_end = (fb_base + fb_len + HUGE_PAGE - 1) & !(HUGE_PAGE - 1);
     let mut uc_count = 0;
     let mut uc_ram_overlap = false;
     let mut pa = fb_start;
-    while pa < fb_end {
+    let fb_end = match fb_base.checked_add(fb_len) {
+        // Fits comfortably inside the mapped window: mark as planned.
+        Some(raw_end) if raw_end <= map_limit => {
+            (raw_end + HUGE_PAGE - 1) & !(HUGE_PAGE - 1)
+        }
+        // Overlaps the window edge: mark only what is mapped.
+        Some(raw_end) => {
+            crate::serial::print_fmt(format_args!(
+                "[pt] WARNING: framebuffer {:#x}..{:#x} extends past the mapped {:#x}; marking only the mapped part UC\n",
+                fb_base, raw_end, map_limit
+            ));
+            map_limit
+        }
+        // Base+length overflows u64: mark nothing.
+        None => {
+            crate::serial::print_fmt(format_args!(
+                "[pt] WARNING: framebuffer base {:#x} + len {:#x} overflows; skipping UC marking\n",
+                fb_base, fb_len
+            ));
+            fb_start
+        }
+    };
+    while pa < fb_end && pa < map_limit {
         unsafe {
             set_pde(pa, leaf_flags() | PageTableFlags::WRITE_THROUGH | PageTableFlags::NO_CACHE)
         };
@@ -180,9 +208,9 @@ pub fn init(fb_info: FramebufferInfo, memory_map: &MemoryMap<'static>) {
         pa += HUGE_PAGE;
     }
     crate::serial::print_fmt(format_args!(
-        "[pt] framebuffer {:#x}..{:#x}: {} UC PDE(s), ram-overlap={}\n",
+        "[pt] framebuffer base={:#x} len={:#x}: {} UC PDE(s), ram-overlap={}\n",
         fb_base,
-        fb_base + fb_len,
+        fb_len,
         uc_count,
         uc_ram_overlap
     ));
