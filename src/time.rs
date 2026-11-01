@@ -17,8 +17,8 @@ use x86_64::instructions::port::Port;
 
 /// Base input frequency of the PIT in Hz.
 const PIT_BASE_FREQUENCY: u64 = 1_193_182;
-/// Channel 0 output frequency in Hz (divisor 11_932 => 100.0004 Hz).
-const TICKS_PER_SECOND: u64 = 100;
+/// Channel 0 output frequency in Hz (divisor 11,932 => 100.0004 Hz).
+pub const TICKS_PER_SECOND: u64 = 100;
 /// Divisor programmed into the PIT for [`TICKS_PER_SECOND`] (rounded).
 const PIT_DIVISOR: u16 = (PIT_BASE_FREQUENCY / TICKS_PER_SECOND) as u16;
 /// Milliseconds between timer ticks (1000 / 100 Hz).
