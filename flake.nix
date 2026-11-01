@@ -33,6 +33,10 @@
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             grub2
             xorriso
+            # FAT32 data-disk image for the virtio-blk driver (issue #14):
+            # mkfs.vfat (dosfstools) + mcopy/mdir (mtools).
+            dosfstools
+            mtools
           ];
 
           shellHook = ''

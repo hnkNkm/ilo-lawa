@@ -227,6 +227,8 @@ impl Shell {
             "shutdown" => self.cmd_shutdown(),
             "reboot" => self.cmd_reboot(),
             "lspci" => self.cmd_lspci(args),
+            "disks" => self.cmd_disks(),
+            "diskread" => self.cmd_with_required_path("diskread", args, Self::cmd_diskread),
             "tasks" => self.cmd_tasks(),
             "taskdemo" => self.cmd_taskdemo(),
             // Filesystem commands with unified argument handling
@@ -238,6 +240,9 @@ impl Shell {
             "rm" => self.cmd_with_required_path("rm", args, Self::cmd_rm),
             "rmdir" => self.cmd_with_required_path("rmdir", args, Self::cmd_rmdir),
             "write" => self.cmd_write(args),
+            // FAT32 data disk (read-only, issue #14)
+            "fatls" => self.cmd_fatls(self.get_first_arg(args, "/")),
+            "fatcat" => self.cmd_with_required_path("fatcat", args, Self::cmd_fatcat),
             "" => {}, // Empty command
             _ => {
                 crate::terminal::print("Unknown command: ");
@@ -289,6 +294,8 @@ impl Shell {
         crate::terminal::print("  shutdown - Shutdown the system\n");
         crate::terminal::print("  reboot   - Reboot the system\n");
         crate::terminal::print("  lspci    - List PCI devices (-v for details)\n");
+        crate::terminal::print("  disks    - List block devices (virtio-blk) and capacity\n");
+        crate::terminal::print("  diskread - Hex dump a 512-byte data-disk sector\n");
         crate::terminal::print("  tasks    - List tasks (id, name, state)\n");
         crate::terminal::print("  taskdemo - Spawn demo/stress/counter/sleeper tasks\n");
         crate::terminal::print("\nFilesystem Commands:\n");
@@ -300,6 +307,9 @@ impl Shell {
         crate::terminal::print("  rm       - Remove file\n");
         crate::terminal::print("  rmdir    - Remove an empty directory\n");
         crate::terminal::print("  write    - Create file with content (overwrites existing file)\n");
+        crate::terminal::print("\nFAT32 Data Disk (read-only, virtio-blk):\n");
+        crate::terminal::print("  fatls    - List a directory on the data disk\n");
+        crate::terminal::print("  fatcat   - Print a file from the data disk\n");
     }
     
     fn cmd_clear(&self) {
@@ -388,6 +398,117 @@ impl Shell {
             crate::terminal::print("(device table full, some functions not listed)\n");
         }
         crate::terminal::print_fmt(format_args!("{} device(s)\n", count));
+    }
+
+    // Block devices: virtio-blk discovery result + capacity (issue #14).
+    fn cmd_disks(&self) {
+        crate::terminal::print("Block devices:\n");
+        match crate::drivers::virtio_blk::device_info() {
+            Some(info) => {
+                let mib = info.capacity_sectors * 512 / (1024 * 1024);
+                crate::terminal::print_fmt(format_args!(
+                    "  virtio-blk {:02x}:{:02x}.{} io BAR0 {:#x} queue {} — {} sector(s) ({} MiB){}\n",
+                    info.pci.0,
+                    info.pci.1,
+                    info.pci.2,
+                    info.io_base,
+                    info.queue_size,
+                    info.capacity_sectors,
+                    mib,
+                    if info.read_only { " [read-only]" } else { "" },
+                ));
+            }
+            None => crate::terminal::print("  (none — no virtio-blk device initialized)\n"),
+        }
+        if let Ok(summary) = crate::fs::fat32::with_fs(|fs| Ok(fs.summary())) {
+            crate::terminal::print_fmt(format_args!("  {}\n", summary));
+        }
+    }
+
+    // Hex dump one 512-byte sector of the data disk.
+    fn cmd_diskread(&self, sector_arg: &str) {
+        let sector = match sector_arg.parse::<u64>() {
+            Ok(s) => s,
+            Err(_) => {
+                crate::terminal::print_fmt(format_args!(
+                    "diskread: invalid sector '{}'\n",
+                    sector_arg
+                ));
+                return;
+            }
+        };
+        match crate::drivers::block::read_sectors(sector, 1) {
+            Err(e) => {
+                crate::terminal::print_fmt(format_args!("diskread: {}\n", e));
+            }
+            Ok(data) => {
+                crate::terminal::print_fmt(format_args!("sector {}:\n", sector));
+                for row in 0..data.len() / 16 {
+                    crate::terminal::print_fmt(format_args!(
+                        "{:04x} ",
+                        row * 16
+                    ));
+                    for b in &data[row * 16..row * 16 + 16] {
+                        crate::terminal::print_fmt(format_args!("{:02X} ", b));
+                    }
+                    crate::terminal::print(" ");
+                    for b in &data[row * 16..row * 16 + 16] {
+                        crate::terminal::print_fmt(format_args!(
+                            "{}",
+                            if (0x20..0x7F).contains(b) {
+                                *b as char
+                            } else {
+                                '.'
+                            }
+                        ));
+                    }
+                    crate::terminal::print("\n");
+                }
+            }
+        }
+    }
+
+    // List a directory on the FAT32 data disk.
+    fn cmd_fatls(&self, path: &str) {
+        match crate::fs::fat32::with_fs(|fs| fs.list(path)) {
+            Err(e) => crate::terminal::print_fmt(format_args!("fatls: {}\n", e)),
+            Ok(entries) => {
+                let count = entries.len();
+                for entry in &entries {
+                    if entry.is_directory {
+                        crate::terminal::print_fmt(format_args!("  <DIR>  {}/\n", entry.name));
+                    } else {
+                        crate::terminal::print_fmt(format_args!(
+                            "  {:>8}  {}\n",
+                            entry.size, entry.name
+                        ));
+                    }
+                }
+                crate::terminal::print_fmt(format_args!("{} entr(y/ies)\n", count));
+            }
+        }
+    }
+
+    // Print a file from the FAT32 data disk.
+    fn cmd_fatcat(&self, path: &str) {
+        match crate::fs::fat32::with_fs(|fs| fs.read_file(path)) {
+            Err(e) => crate::terminal::print_fmt(format_args!("fatcat: {}\n", e)),
+            Ok(data) => {
+                for &b in &data {
+                    crate::terminal::print_fmt(format_args!(
+                        "{}",
+                        if (0x20..0x7F).contains(&b) || b == b'\n' || b == b'\t' {
+                            b as char
+                        } else {
+                            '.'
+                        }
+                    ));
+                }
+                if !data.ends_with(b"\n") {
+                    crate::terminal::print("\n");
+                }
+            }
+        }
     }
     
     fn cmd_uptime(&self) {

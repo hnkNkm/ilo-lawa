@@ -1,279 +1,462 @@
-// FAT32 filesystem implementation
-//
-// Forward-looking driver staged for issue #14: the block-device layer it
-// needs is not wired up yet, so most items are intentionally unused.
-#![allow(dead_code)]
+//! Read-only FAT32 driver over the registered block device (issue #14).
+//!
+//! The disk is a raw image attached via virtio-blk (`make disk`); sector 0
+//! is either the FAT32 boot sector itself (superfloppy, what `mkfs.vfat`
+//! produces) or an MBR whose FAT32-typed partition (types 0x0B/0x0C) holds
+//! the boot sector — both layouts are detected at mount time.
+//!
+//! Read-only: boot sector validation, on-demand FAT sector reads (one
+//! sector cached), FAT chain walking, directory parsing with 8.3 short
+//! names (honoring the NT lowercase flags) and LFN (long file name)
+//! assembly with checksum verification, path resolution and file reads.
+//! Everything runs in thread context; the instance sits behind `FAT32`.
+//!
+//! This deliberately does NOT implement the `FileSystem` trait of
+//! `fs::mod`: that trait is the in-RAM root filesystem behind `ls`/`cd`/
+//! `cat`, and the data disk is a separate, read-only surface exposed via
+//! `fatls`/`fatcat`. Replacing the RAM fs wholesale is future work.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::vec;
-use super::{FileSystem as FSTrait, FileSystemError, DirEntry};
+use spin::Mutex;
 
-// FAT32 Constants
-const SECTOR_SIZE: usize = 512;
-const FAT32_EOC: u32 = 0x0FFFFFFF;  // End of cluster chain
-const FAT32_BAD: u32 = 0x0FFFFFF7;  // Bad cluster
-const FAT32_FREE: u32 = 0x00000000; // Free cluster
+use crate::drivers::block;
 
-// FAT32 Boot Sector structure
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-pub struct Fat32BootSector {
-    // Common BPB structure
-    pub jmp_boot: [u8; 3],           // Jump instruction to boot code
-    pub oem_name: [u8; 8],           // OEM name (e.g., "MSWIN4.1")
-    pub bytes_per_sector: u16,       // Bytes per sector (usually 512)
-    pub sectors_per_cluster: u8,      // Sectors per cluster
-    pub reserved_sectors: u16,        // Number of reserved sectors
-    pub num_fats: u8,                // Number of FAT copies (usually 2)
-    pub root_entries: u16,            // 0 for FAT32
-    pub total_sectors_16: u16,        // 0 for FAT32
-    pub media: u8,                   // Media descriptor
-    pub fat_size_16: u16,            // 0 for FAT32
-    pub sectors_per_track: u16,      // Sectors per track
-    pub num_heads: u16,              // Number of heads
-    pub hidden_sectors: u32,         // Hidden sectors
-    pub total_sectors_32: u32,       // Total sectors (FAT32)
-    
-    // FAT32 specific
-    pub fat_size_32: u32,            // Sectors per FAT
-    pub ext_flags: u16,              // Extended flags
-    pub fs_version: u16,             // File system version
-    pub root_cluster: u32,           // Root directory cluster
-    pub fs_info: u16,                // FSInfo sector
-    pub backup_boot_sector: u16,     // Backup boot sector
-    pub reserved: [u8; 12],          // Reserved
-    pub drive_number: u8,            // Drive number
-    pub reserved1: u8,               // Reserved
-    pub boot_signature: u8,          // Boot signature (0x29)
-    pub volume_id: u32,              // Volume ID
-    pub volume_label: [u8; 11],      // Volume label
-    pub fs_type: [u8; 8],           // File system type ("FAT32   ")
-}
-
-// FAT32 Directory Entry
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-pub struct Fat32DirEntry {
-    pub name: [u8; 11],              // 8.3 filename
-    pub attributes: u8,              // File attributes
-    pub reserved: u8,                // Reserved
-    pub creation_time_tenth: u8,     // Creation time (tenths of second)
-    pub creation_time: u16,          // Creation time
-    pub creation_date: u16,          // Creation date
-    pub last_access_date: u16,       // Last access date
-    pub first_cluster_high: u16,     // High 16 bits of first cluster
-    pub write_time: u16,             // Last write time
-    pub write_date: u16,             // Last write date
-    pub first_cluster_low: u16,      // Low 16 bits of first cluster
-    pub file_size: u32,              // File size in bytes
-}
-
-// File attributes
-const ATTR_READ_ONLY: u8 = 0x01;
-const ATTR_HIDDEN: u8 = 0x02;
-const ATTR_SYSTEM: u8 = 0x04;
+const SECTOR: usize = 512; // validated against the BPB
 const ATTR_VOLUME_ID: u8 = 0x08;
 const ATTR_DIRECTORY: u8 = 0x10;
-const ATTR_ARCHIVE: u8 = 0x20;
-const ATTR_LONG_NAME: u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID;
+const ATTR_LONG_NAME: u8 = 0x0F; // RO|HIDDEN|SYSTEM|VOLUME_ID
+const DIR_ENTRY_SIZE: usize = 32;
 
+/// Parsed FAT32 BIOS Parameter Block (the fields the driver needs).
+#[derive(Clone, Copy)]
+struct Bpb {
+    sectors_per_cluster: u8,
+    reserved_sectors: u16,
+    num_fats: u8,
+    fat_size_sectors: u32,
+    root_cluster: u32,
+    total_sectors: u64,
+}
+
+impl Bpb {
+    /// Data region start, relative to the volume base (LBA of cluster 2).
+    fn data_start(&self) -> u64 {
+        u64::from(self.reserved_sectors)
+            + u64::from(self.num_fats) * u64::from(self.fat_size_sectors)
+    }
+
+    fn cluster_lba(&self, base: u64, cluster: u32) -> u64 {
+        base + self.data_start() + (u64::from(cluster) - 2) * u64::from(self.sectors_per_cluster)
+    }
+
+    fn total_clusters(&self) -> u64 {
+        (self.total_sectors - self.data_start()) / u64::from(self.sectors_per_cluster)
+    }
+}
+
+/// Validate a sector as a FAT32 boot sector and extract the BPB. Field
+/// reads are explicit little-endian — no unaligned pointer casts.
+fn parse_boot_sector(sec: &[u8]) -> Option<Bpb> {
+    if sec.len() < SECTOR {
+        return None;
+    }
+    let u16_at = |off: usize| u16::from_le_bytes([sec[off], sec[off + 1]]);
+    let u32_at =
+        |off: usize| u32::from_le_bytes([sec[off], sec[off + 1], sec[off + 2], sec[off + 3]]);
+
+    // Boot signature + the FAT32 markers: 512-byte sectors, no FAT12/16
+    // root-dir area, FAT size only in the 32-bit field.
+    if sec[510] != 0x55 || sec[511] != 0xAA {
+        return None;
+    }
+    if u16_at(11) != 512 || u16_at(17) != 0 || u16_at(19) != 0 || u16_at(22) != 0 {
+        return None;
+    }
+    let sectors_per_cluster = sec[13];
+    let num_fats = sec[16];
+    let fat_size_sectors = u32_at(36);
+    let root_cluster = u32_at(44);
+    let total_sectors = {
+        let t32 = u32_at(32);
+        if t32 != 0 {
+            u64::from(t32)
+        } else {
+            u64::from(u16_at(19))
+        }
+    };
+    // Geometry sanity: nonzero power-of-two cluster, at least one FAT, a
+    // data region that actually exists, root dir in the data region.
+    if !sectors_per_cluster.is_power_of_two()
+        || num_fats == 0
+        || fat_size_sectors == 0
+        || root_cluster < 2
+    {
+        return None;
+    }
+    let data_start = u64::from(u16_at(14))
+        + u64::from(num_fats) * u64::from(fat_size_sectors);
+    if total_sectors <= data_start {
+        return None;
+    }
+    Some(Bpb {
+        sectors_per_cluster,
+        reserved_sectors: u16_at(14),
+        num_fats,
+        fat_size_sectors,
+        root_cluster,
+        total_sectors,
+    })
+}
+
+/// Locate the volume: superfloppy (sector 0 is the boot sector) or MBR
+/// with a FAT32 partition. Returns (BPB, volume base LBA, boot sector).
+fn detect_volume(sector0: &[u8]) -> Result<(Bpb, u64, [u8; SECTOR]), String> {
+    if let Some(bpb) = parse_boot_sector(sector0) {
+        let mut boot = [0u8; SECTOR];
+        boot.copy_from_slice(&sector0[..SECTOR]);
+        return Ok((bpb, 0, boot));
+    }
+
+    // MBR: signature + one FAT32-typed partition entry (types 0x0B/0x0C).
+    if sector0.len() >= SECTOR && sector0[510] == 0x55 && sector0[511] == 0xAA {
+        for i in 0..4 {
+            let entry = &sector0[446 + 16 * i..446 + 16 * i + 16];
+            let part_type = entry[4];
+            let lba = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
+            if part_type == 0x0B || part_type == 0x0C {
+                let boot = block::read_sectors(u64::from(lba), 1)?;
+                if let Some(bpb) = parse_boot_sector(&boot) {
+                    let mut sector = [0u8; SECTOR];
+                    sector.copy_from_slice(&boot[..SECTOR]);
+                    return Ok((bpb, u64::from(lba), sector));
+                }
+            }
+        }
+        return Err("no FAT32 partition in MBR (need type 0x0B/0x0C)".into());
+    }
+    Err("sector 0 is neither a FAT32 boot sector nor an MBR".into())
+}
+
+/// Volume label from the boot sector (bytes 71..=81, space-padded).
+fn volume_label(boot: &[u8; SECTOR]) -> String {
+    let mut label = String::new();
+    for &b in &boot[71..82] {
+        if b != 0x20 && b != 0x00 {
+            label.push(b as char);
+        }
+    }
+    if label.is_empty() {
+        label.push_str("NO NAME");
+    }
+    label
+}
+
+/// One directory entry as surfaced to callers (LFN applied when valid).
+#[derive(Clone)]
+pub struct FatDirEntry {
+    pub name: String,
+    pub is_directory: bool,
+    pub size: u32,
+    pub first_cluster: u32,
+}
+
+/// Mounted read-only FAT32 volume.
 pub struct Fat32FileSystem {
-    // For now, we'll use a simulated disk in memory
-    disk: Vec<u8>,
-    boot_sector: Fat32BootSector,
-    fat_start_sector: u32,
-    data_start_sector: u32,
-    current_dir_cluster: u32,
+    bpb: Bpb,
+    /// LBA where the volume (boot sector) starts: 0 for a superfloppy,
+    /// the MBR partition base otherwise.
+    base_lba: u64,
+    root_cluster: u32,
+    volume_label: String,
+    /// Recently used FAT sector cache: `fat_cache_sector` is volume-
+    /// relative (FAT start excluded); `u32::MAX` = empty.
+    fat_cache_sector: u32,
+    fat_cache: [u8; SECTOR],
 }
 
 impl Fat32FileSystem {
-    pub fn new() -> Self {
-        // Create a minimal FAT32 filesystem in memory
-        // This is just for demonstration - real implementation would read from disk
-        let mut disk = vec![0u8; 32 * 1024 * 1024]; // 32MB disk
-        
-        // Create boot sector
-        let boot_sector = Fat32BootSector {
-            jmp_boot: [0xEB, 0x58, 0x90],
-            oem_name: *b"ILOLAWA ",
-            bytes_per_sector: 512,
-            sectors_per_cluster: 8,  // 4KB clusters
-            reserved_sectors: 32,
-            num_fats: 2,
-            root_entries: 0,
-            total_sectors_16: 0,
-            media: 0xF8,
-            fat_size_16: 0,
-            sectors_per_track: 63,
-            num_heads: 255,
-            hidden_sectors: 0,
-            total_sectors_32: 65536, // 32MB / 512
-            fat_size_32: 256,
-            ext_flags: 0,
-            fs_version: 0,
-            root_cluster: 2,
-            fs_info: 1,
-            backup_boot_sector: 6,
-            reserved: [0; 12],
-            drive_number: 0x80,
-            reserved1: 0,
-            boot_signature: 0x29,
-            volume_id: 0x12345678,
-            volume_label: *b"ILO-LAWA   ",
-            fs_type: *b"FAT32   ",
+    /// Detect and mount the volume on the registered block device.
+    pub fn mount() -> Result<Fat32FileSystem, String> {
+        let sector0 = block::read_sectors(0, 1)?;
+        let (bpb, base_lba, boot) = detect_volume(&sector0)?;
+        let mut fs = Fat32FileSystem {
+            bpb,
+            base_lba,
+            root_cluster: bpb.root_cluster,
+            volume_label: volume_label(&boot),
+            fat_cache_sector: u32::MAX,
+            fat_cache: [0; SECTOR],
         };
-        
-        // Write boot sector to disk
-        unsafe {
-            let boot_bytes = core::slice::from_raw_parts(
-                &boot_sector as *const _ as *const u8,
-                core::mem::size_of::<Fat32BootSector>()
-            );
-            disk[..boot_bytes.len()].copy_from_slice(boot_bytes);
-        }
-        
-        // Mark boot sector signature
-        disk[510] = 0x55;
-        disk[511] = 0xAA;
-        
-        // Initialize FAT tables
-        let fat_start = boot_sector.reserved_sectors as usize * SECTOR_SIZE;
-        let fat_size = boot_sector.fat_size_32 as usize * SECTOR_SIZE;
-        
-        // First two FAT entries are special
-        disk[fat_start..fat_start+4].copy_from_slice(&0x0FFFFFF8u32.to_le_bytes());
-        disk[fat_start+4..fat_start+8].copy_from_slice(&FAT32_EOC.to_le_bytes());
-        // Root directory cluster (cluster 2)
-        disk[fat_start+8..fat_start+12].copy_from_slice(&FAT32_EOC.to_le_bytes());
-        
-        // Copy FAT to second FAT
-        let fat2_start = fat_start + fat_size;
-        let fat_data = disk[fat_start..fat_start+12].to_vec();
-        disk[fat2_start..fat2_start+12].copy_from_slice(&fat_data);
-        
-        Fat32FileSystem {
-            disk,
-            boot_sector,
-            fat_start_sector: boot_sector.reserved_sectors as u32,
-            data_start_sector: boot_sector.reserved_sectors as u32 + 
-                              (boot_sector.num_fats as u32 * boot_sector.fat_size_32),
-            current_dir_cluster: 2, // Root directory
-        }
+        fs.fat_entry(2)?; // probe: the FAT must be readable to be usable
+        Ok(fs)
     }
-    
-    fn cluster_to_sector(&self, cluster: u32) -> u32 {
-        self.data_start_sector + (cluster - 2) * self.boot_sector.sectors_per_cluster as u32
-    }
-    
-    fn read_cluster(&self, cluster: u32) -> Vec<u8> {
-        let sector = self.cluster_to_sector(cluster);
-        let offset = sector as usize * SECTOR_SIZE;
-        let size = self.boot_sector.sectors_per_cluster as usize * SECTOR_SIZE;
-        self.disk[offset..offset + size].to_vec()
-    }
-    
-    fn get_fat_entry(&self, cluster: u32) -> u32 {
-        let fat_offset = cluster * 4;
-        let fat_sector = self.fat_start_sector + (fat_offset / SECTOR_SIZE as u32);
-        let fat_entry_offset = (fat_offset % SECTOR_SIZE as u32) as usize;
-        
-        let sector_offset = fat_sector as usize * SECTOR_SIZE;
-        let bytes = &self.disk[sector_offset + fat_entry_offset..sector_offset + fat_entry_offset + 4];
-        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & 0x0FFFFFFF
-    }
-    
-    fn parse_dir_entry(&self, entry_bytes: &[u8]) -> Option<Fat32DirEntry> {
-        if entry_bytes.len() < 32 || entry_bytes[0] == 0x00 || entry_bytes[0] == 0xE5 {
-            return None;
-        }
-        
-        unsafe {
-            Some(*(entry_bytes.as_ptr() as *const Fat32DirEntry))
-        }
-    }
-}
 
-impl FSTrait for Fat32FileSystem {
-    fn read_file(&mut self, _path: &str) -> Result<Vec<u8>, FileSystemError> {
-        // Simplified: read a file from current directory
-        Err(FileSystemError::NotImplemented)
+    /// FAT entry for `cluster` (masked to 28 bits), via the cached sector.
+    fn fat_entry(&mut self, cluster: u32) -> Result<u32, String> {
+        let fat_offset = cluster * 4;
+        let sector = fat_offset / SECTOR as u32;
+        let offset = (fat_offset % SECTOR as u32) as usize;
+        if self.fat_cache_sector != sector {
+            let lba = self.base_lba + u64::from(self.bpb.reserved_sectors) + u64::from(sector);
+            let data = block::read_sectors(lba, 1)?;
+            self.fat_cache.copy_from_slice(&data[..SECTOR]);
+            self.fat_cache_sector = sector;
+        }
+        Ok(u32::from_le_bytes([
+            self.fat_cache[offset],
+            self.fat_cache[offset + 1],
+            self.fat_cache[offset + 2],
+            self.fat_cache[offset + 3],
+        ]) & 0x0FFF_FFFF)
     }
-    
-    fn write_file(&mut self, _path: &str, _data: &[u8]) -> Result<(), FileSystemError> {
-        Err(FileSystemError::NotImplemented)
+
+    /// Read the whole cluster chain of `start` (capped at the volume's
+    /// cluster count so a corrupt FAT cannot loop forever).
+    fn read_chain(&mut self, start: u32) -> Result<Vec<u8>, String> {
+        let spc = self.bpb.sectors_per_cluster as usize;
+        let mut data = Vec::new();
+        let mut cluster = start;
+        let max_hops = self.bpb.total_clusters() + 1;
+        let mut hops = 0u64;
+        loop {
+            if cluster < 2 {
+                return Err("FAT chain: invalid cluster".into());
+            }
+            let lba = self.bpb.cluster_lba(self.base_lba, cluster);
+            data.extend_from_slice(&block::read_sectors(lba, spc)?);
+            hops += 1;
+            if hops > max_hops {
+                return Err("FAT chain: loop detected".into());
+            }
+            let next = self.fat_entry(cluster)?;
+            // >= 0x0FFFFFF8 = end of chain; 0x0FFFFFF7 = bad cluster.
+            if next >= 0x0FFF_FFF8 {
+                break;
+            }
+            if next == 0x0FFF_FFF7 {
+                return Err("FAT chain: bad cluster".into());
+            }
+            cluster = next;
+        }
+        Ok(data)
     }
-    
-    fn create_file(&mut self, _path: &str) -> Result<(), FileSystemError> {
-        Err(FileSystemError::NotImplemented)
-    }
-    
-    fn delete_file(&mut self, _path: &str) -> Result<(), FileSystemError> {
-        Err(FileSystemError::NotImplemented)
-    }
-    
-    fn create_directory(&mut self, _path: &str) -> Result<(), FileSystemError> {
-        Err(FileSystemError::NotImplemented)
-    }
-    
-    fn delete_directory(&mut self, _path: &str) -> Result<(), FileSystemError> {
-        Err(FileSystemError::NotImplemented)
-    }
-    
-    fn list_directory(&mut self, _path: &str) -> Result<Vec<DirEntry>, FileSystemError> {
+
+    /// Parse one directory cluster chain into entries. LFN fragments are
+    /// assembled when their sequence numbers and checksum line up with
+    /// the following short entry.
+    fn read_dir(&mut self, dir_cluster: u32) -> Result<Vec<FatDirEntry>, String> {
+        let raw = self.read_chain(dir_cluster)?;
         let mut entries = Vec::new();
-        let cluster_data = self.read_cluster(self.current_dir_cluster);
-        
-        // Parse directory entries (32 bytes each)
-        for i in 0..(cluster_data.len() / 32) {
-            let entry_bytes = &cluster_data[i * 32..(i + 1) * 32];
-            
-            if let Some(entry) = self.parse_dir_entry(entry_bytes) {
-                // Skip long name entries and volume labels
-                if entry.attributes & (ATTR_LONG_NAME | ATTR_VOLUME_ID) != 0 {
+        // Collected LFN fragments in disk order (sequence n..1, the short
+        // entry last): (seq, checksum, 13 UCS-2 chars).
+        let mut lfn_parts: Vec<(u8, u8, [u16; 13])> = Vec::new();
+
+        for chunk in raw.chunks_exact(DIR_ENTRY_SIZE) {
+            match chunk[0] {
+                0x00 => break, // end-of-directory marker
+                0xE5 => {
+                    lfn_parts.clear(); // deleted entry: drop stale fragments
                     continue;
                 }
-                
-                // Convert 8.3 name to string
-                let mut name = String::new();
-                for &b in &entry.name[..8] {
-                    if b != 0x20 { // Skip spaces
-                        name.push(b as char);
-                    }
+                _ => {}
+            }
+            let attr = chunk[11];
+
+            if attr == ATTR_LONG_NAME {
+                let seq = chunk[0] & 0x1F;
+                let mut chars = [0u16; 13];
+                let offsets = [1usize, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+                for (n, &off) in offsets.iter().enumerate() {
+                    chars[n] = u16::from_le_bytes([chunk[off], chunk[off + 1]]);
                 }
-                if entry.name[8] != 0x20 {
-                    name.push('.');
-                    for &b in &entry.name[8..11] {
-                        if b != 0x20 {
-                            name.push(b as char);
-                        }
-                    }
+                lfn_parts.push((seq, chunk[13], chars));
+                continue;
+            }
+            if attr & ATTR_VOLUME_ID != 0 {
+                lfn_parts.clear();
+                continue; // volume label pseudo-entry
+            }
+
+            let short = Self::short_name(chunk);
+            let name =
+                Self::assemble_lfn(&lfn_parts, &chunk[..11]).unwrap_or_else(|| short.clone());
+            lfn_parts.clear();
+
+            let first_cluster = (u32::from(u16::from_le_bytes([chunk[20], chunk[21]])) << 16)
+                | u32::from(u16::from_le_bytes([chunk[26], chunk[27]]));
+            entries.push(FatDirEntry {
+                name,
+                is_directory: attr & ATTR_DIRECTORY != 0,
+                size: u32::from_le_bytes([chunk[28], chunk[29], chunk[30], chunk[31]]),
+                first_cluster,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// 8.3 short name, honoring the NT lowercase flags in the ntres byte
+    /// (bit 3 = base lowercase, bit 4 = extension lowercase).
+    fn short_name(chunk: &[u8]) -> String {
+        let mut name = String::new();
+        let lower_base = chunk[12] & 0x08 != 0;
+        let lower_ext = chunk[12] & 0x10 != 0;
+        for &b in &chunk[..8] {
+            if b == 0x20 {
+                break;
+            }
+            name.push(if lower_base {
+                (b as char).to_ascii_lowercase()
+            } else {
+                b as char
+            });
+        }
+        if chunk[8] != 0x20 {
+            name.push('.');
+            for &b in &chunk[8..11] {
+                if b == 0x20 {
+                    break;
                 }
-                
-                entries.push(DirEntry {
-                    name,
-                    is_directory: (entry.attributes & ATTR_DIRECTORY) != 0,
-                    size: entry.file_size as u64,
+                name.push(if lower_ext {
+                    (b as char).to_ascii_lowercase()
+                } else {
+                    b as char
                 });
             }
         }
-        
-        Ok(entries)
+        name
     }
-    
-    fn is_directory(&mut self, _path: &str) -> bool {
-        false
+
+    /// LFN checksum over the 11 raw name bytes of a short entry:
+    /// rotate the running sum right by one, then add the byte.
+    fn lfn_checksum(short_name_bytes: &[u8]) -> u8 {
+        let mut sum = 0u8;
+        for &b in &short_name_bytes[..11] {
+            sum = sum.rotate_right(1).wrapping_add(b);
+        }
+        sum
     }
-    
-    fn is_file(&mut self, _path: &str) -> bool {
-        false
+
+    /// Reassemble an LFN from the collected fragments when valid: sequence
+    /// numbers must run 1..=n ascending, every fragment's stored checksum
+    /// (its byte 13) must equal the checksum of the short entry's 11 name
+    /// bytes, and characters are mapped as ASCII (anything else becomes
+    /// '?'). 13 chars per fragment, NUL-terminated, 0xFFFF-padded.
+    fn assemble_lfn(
+        parts: &[(u8, u8, [u16; 13])],
+        short_name_bytes: &[u8],
+    ) -> Option<String> {
+        if parts.is_empty() {
+            return None;
+        }
+        let expected = Self::lfn_checksum(short_name_bytes);
+        let mut ordered = parts.to_vec();
+        ordered.sort_by_key(|(seq, _, _)| *seq);
+        for (i, (seq, checksum, _)) in ordered.iter().enumerate() {
+            if *seq != (i + 1) as u8 || *checksum != expected {
+                return None;
+            }
+        }
+        let mut name = String::new();
+        for (_, _, chars) in &ordered {
+            for &c in chars {
+                match c {
+                    0x0000 | 0xFFFF => return Some(name),
+                    0x20..=0x7E => name.push(c as u8 as char),
+                    _ => name.push('?'), // non-ASCII: keep position stable
+                }
+            }
+        }
+        Some(name)
     }
-    
-    fn get_current_directory(&self) -> String {
-        "/".into() // Simplified
+
+    /// Case-insensitive name match (8.3 and LFN are compared uppercase).
+    fn name_eq(a: &str, b: &str) -> bool {
+        a.eq_ignore_ascii_case(b)
     }
-    
-    fn set_current_directory(&mut self, _path: &str) -> Result<(), FileSystemError> {
-        Err(FileSystemError::NotImplemented)
+
+    /// Resolve a slash-separated path (always from the volume root — the
+    /// read-only surface has no persistent FAT cwd) to its entry.
+    fn resolve(&mut self, path: &str) -> Result<FatDirEntry, String> {
+        let mut current = FatDirEntry {
+            name: String::from("/"),
+            is_directory: true,
+            size: 0,
+            first_cluster: self.root_cluster,
+        };
+        for comp in path.split('/').filter(|c| !c.is_empty()) {
+            if !current.is_directory {
+                return Err(format!("not a directory: {}", current.name));
+            }
+            let entries = self.read_dir(current.first_cluster)?;
+            let entry = entries
+                .iter()
+                .find(|e| Self::name_eq(&e.name, comp))
+                .ok_or_else(|| format!("no such entry: {}", comp))?;
+            let mut entry = entry.clone();
+            // "." stays; ".." may encode the root as cluster 0.
+            if Self::name_eq(&entry.name, "..") && entry.first_cluster == 0 {
+                entry.first_cluster = self.root_cluster;
+            }
+            current = entry;
+        }
+        Ok(current)
     }
+
+    /// List a directory path; "" and "/" mean the root.
+    pub fn list(&mut self, path: &str) -> Result<Vec<FatDirEntry>, String> {
+        let dir = self.resolve(path)?;
+        if !dir.is_directory {
+            return Err(format!("not a directory: {}", path));
+        }
+        self.read_dir(dir.first_cluster)
+    }
+
+    /// Read a file's contents (truncated to the directory-entry size).
+    pub fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        let file = self.resolve(path)?;
+        if file.is_directory {
+            return Err(format!("is a directory: {}", path));
+        }
+        if file.size == 0 || file.first_cluster < 2 {
+            return Ok(Vec::new());
+        }
+        let mut data = self.read_chain(file.first_cluster)?;
+        data.truncate(file.size as usize);
+        Ok(data)
+    }
+
+    /// Volume label + geometry summary for `disks`/boot log.
+    pub fn summary(&self) -> String {
+        let size_kib = self.bpb.total_clusters()
+            * u64::from(self.bpb.sectors_per_cluster)
+            * 512
+            / 1024;
+        format!(
+            "FAT32 \"{}\": {} KiB, {} sector(s)/cluster, volume at LBA {}",
+            self.volume_label,
+            size_kib,
+            self.bpb.sectors_per_cluster,
+            self.base_lba
+        )
+    }
+}
+
+static FAT32: Mutex<Option<Fat32FileSystem>> = Mutex::new(None);
+
+/// Mount the data disk. Returns the summary string on success. Thread
+/// context only, after `virtio_blk::init`.
+pub fn mount() -> Result<String, String> {
+    let fs = Fat32FileSystem::mount()?;
+    let summary = fs.summary();
+    *FAT32.lock() = Some(fs);
+    Ok(summary)
+}
+
+/// Run `f` with the mounted volume.
+pub fn with_fs<R>(f: impl FnOnce(&mut Fat32FileSystem) -> Result<R, String>) -> Result<R, String> {
+    let mut guard = FAT32.lock();
+    let fs = guard.as_mut().ok_or("no FAT32 volume mounted")?;
+    f(fs)
 }

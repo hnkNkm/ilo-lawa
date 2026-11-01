@@ -337,6 +337,37 @@ pub extern "C" fn kernel_main_owned() -> ! {
         pci_devices
     ));
 
+    // Storage (issue #14): virtio-blk over the legacy PCI transport,
+    // polled completion — no IRQ is routed to the device, so this never
+    // runs from an interrupt handler. Needs the heap (the virtqueue rings
+    // are identity-mapped heap RAM = DMA memory) and the PCI table above.
+    // Failure is not fatal: the kernel boots without a data disk.
+    crate::terminal::print("Initializing storage (virtio-blk)...");
+    match crate::drivers::virtio_blk::init() {
+        Ok(info) => {
+            crate::terminal::print_fmt(format_args!(
+                "\n[virtio-blk] DRIVER_OK: {} sector(s) ({} MiB) at PCI {:02x}:{:02x}.{}\n",
+                info.capacity_sectors,
+                info.capacity_sectors * 512 / (1024 * 1024),
+                info.pci.0,
+                info.pci.1,
+                info.pci.2,
+            ));
+            // Mount the read-only FAT32 volume on the data disk, if one is
+            // there (also not fatal — a raw/blank image just reports an
+            // error below).
+            crate::terminal::print("Mounting data disk (FAT32)...");
+            match crate::fs::fat32::mount() {
+                Ok(summary) => crate::terminal::print_fmt(format_args!(
+                    " [OK] {}\n",
+                    summary
+                )),
+                Err(e) => crate::terminal::print_fmt(format_args!(" [--] {}\n", e)),
+            }
+        }
+        Err(e) => crate::terminal::print_fmt(format_args!(" [--] {}\n", e)),
+    }
+
     // Initialize CPU features (FPU, SSE)
     crate::terminal::print("Initializing CPU features...");
     crate::cpu::init();

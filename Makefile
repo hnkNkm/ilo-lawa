@@ -1,9 +1,14 @@
-.PHONY: build run run-no-kvm test clean setup-ovmf
+.PHONY: build run run-no-kvm test clean setup-ovmf disk
 
 OVMF_PATH = ovmf
 
 # Separate target dir for the test build so `make build`'s cache is untouched.
 TEST_TARGET_DIR = target-test
+
+# Raw data disk for the virtio-blk driver (issue #14). Created once and
+# kept persistent across runs; `make disk` (re)installs the test file.
+DISK_IMG = disk.img
+DISK_SIZE_MIB = 64
 
 setup-ovmf:
 	@if [ ! -d "$(OVMF_PATH)" ]; then \
@@ -12,25 +17,43 @@ setup-ovmf:
 		curl -L https://retrage.github.io/edk2-nightly/bin/RELEASEX64_OVMF.fd -o $(OVMF_PATH)/OVMF.fd; \
 	fi
 
+# 64 MiB FAT32 image (superfloppy, no partition table) with a test file.
+# Needs dosfstools/mtools (in the Nix dev shell). The image is created
+# only if absent; the test file is copied on every invocation (mcopy -o
+# overwrites) so content updates propagate. sha256sum prints the image
+# digest so the booted sector content can be cross-checked.
+disk:
+	@if [ ! -f "$(DISK_IMG)" ]; then \
+		echo "Creating $(DISK_SIZE_MIB) MiB raw disk image ($(DISK_IMG))..."; \
+		dd if=/dev/zero of=$(DISK_IMG) bs=1M count=$(DISK_SIZE_MIB) status=none; \
+		nix develop --impure -c mkfs.vfat -F 32 -n ILOLAWA $(DISK_IMG); \
+	fi
+	nix develop --impure -c sh -c 'printf "Hello from ilo-lawa virtio-blk! (issue #14)\n" > .disk-hello.txt && mcopy -o -i $(DISK_IMG) .disk-hello.txt ::HELLO.TXT && mcopy -o -i $(DISK_IMG) .disk-hello.txt ::long_file_name_test.txt && rm .disk-hello.txt && mdir -i $(DISK_IMG) ::'
+	sha256sum $(DISK_IMG)
+
 build:
 	nix develop --impure -c cargo build --release
 
-run: build setup-ovmf
+run: build setup-ovmf disk
 	mkdir -p esp/efi/boot
 	cp target/x86_64-unknown-uefi/release/ilo-lawa.efi esp/efi/boot/bootx64.efi
 	nix develop --impure -c qemu-system-x86_64 \
 		-enable-kvm \
 		-bios $(OVMF_PATH)/OVMF.fd \
 		-drive format=raw,file=fat:rw:esp \
+		-drive format=raw,file=$(CURDIR)/$(DISK_IMG),if=none,id=disk0 \
+		-device virtio-blk-pci,drive=disk0 \
 		-serial stdio \
 		-m 512M
 
-run-no-kvm: build setup-ovmf
+run-no-kvm: build setup-ovmf disk
 	mkdir -p esp/efi/boot
 	cp target/x86_64-unknown-uefi/release/ilo-lawa.efi esp/efi/boot/bootx64.efi
 	nix develop --impure -c qemu-system-x86_64 \
 		-bios $(OVMF_PATH)/OVMF.fd \
 		-drive format=raw,file=fat:rw:esp \
+		-drive format=raw,file=$(CURDIR)/$(DISK_IMG),if=none,id=disk0 \
+		-device virtio-blk-pci,drive=disk0 \
 		-serial stdio \
 		-m 512M
 
@@ -70,3 +93,4 @@ clean:
 	rm -rf $(OVMF_PATH)
 	rm -rf $(TEST_TARGET_DIR)
 	rm -f test-serial.log
+	rm -f $(DISK_IMG)
