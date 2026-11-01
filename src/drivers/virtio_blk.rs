@@ -483,20 +483,29 @@ impl BlockDevice for VirtioBlkDevice {
             }
             core::hint::spin_loop();
         }
+        // The device wrote the descriptor buffers (status, data) via DMA
+        // before publishing used.idx: acquire fence between observing
+        // used.idx and reading status/data (pairs with the submit-side
+        // release fence; on x86 this is a compiler barrier).
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 
-        // Consume one used entry: id (u32) must be our head (0), len
-        // (u32) is bytes the device wrote (informational only; the status
-        // byte governs success).
+        // Consume THE used entry for this request. Entries are 8 bytes
+        // (id u32 + len u32) starting at used-ring offset 4, indexed by
+        // last_used_idx % queue_size; then advance our index. Slot-based
+        // (not entry-0) access keeps wrap-around and future batching of
+        // several in-flight requests correct.
+        let slot = self.last_used_idx as usize % self.queue_size() as usize;
         // SAFETY: used ring entry inside our region.
-        let used_id = unsafe {
-            let entry = self.queue.used_at() + 4;
-            ptr::read_volatile(entry as *const u32)
+        let (used_id, used_len) = unsafe {
+            let entry = (self.queue.used_at() + 4 + 8 * slot) as *const u32;
+            (ptr::read_volatile(entry), ptr::read_volatile(entry.add(1)))
         };
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
         if used_id != 0 {
             return Err(BlockError::ProtocolError);
         }
+        let _ = used_len; // informational; the status byte governs success
         // Status byte: 0 = OK, 1 = IOERR, 2 = UNSUPPORTED.
         // SAFETY: status byte inside our region.
         let status =
