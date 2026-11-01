@@ -355,19 +355,26 @@ pub extern "C" fn kernel_main_owned() -> ! {
 
     // Main kernel loop: drain the scancode and serial RX queues in thread
     // context. Both queue locks are shared with ISRs, so they may only be
-    // taken with interrupts disabled; enable_and_hlt (sti; hlt) closes
-    // the window where input could arrive between check and halt. One
-    // item per iteration keeps neither queue starved.
+    // taken with interrupts disabled; both are popped and released before
+    // any handler runs, and one item of EACH kind per iteration keeps a
+    // backlog on one input from starving the other. enable_and_hlt
+    // (sti; hlt) closes the window where input could arrive between the
+    // empty check and the halt.
     loop {
         x86_64::instructions::interrupts::disable();
-        if let Some(scancode) = crate::keyboard::try_pop_scancode() {
-            x86_64::instructions::interrupts::enable();
-            crate::keyboard::handle_scancode(scancode);
-        } else if let Some(byte) = crate::serial::try_pop_input() {
-            x86_64::instructions::interrupts::enable();
-            crate::serial::handle_input(byte);
-        } else {
-            x86_64::instructions::interrupts::enable_and_hlt();
+        let scancode = crate::keyboard::try_pop_scancode();
+        let serial_byte = crate::serial::try_pop_input();
+        match (scancode, serial_byte) {
+            (None, None) => x86_64::instructions::interrupts::enable_and_hlt(),
+            (scancode, serial_byte) => {
+                x86_64::instructions::interrupts::enable();
+                if let Some(scancode) = scancode {
+                    crate::keyboard::handle_scancode(scancode);
+                }
+                if let Some(byte) = serial_byte {
+                    crate::serial::handle_input(byte);
+                }
+            }
         }
     }
 }
