@@ -14,9 +14,12 @@
 //! reboot uses the 8042 keyboard-controller reset).
 //!
 //! Known limitation: the S5 sleep type is hardcoded (see [`S5_SLEEP_TYPE`])
-//! because the `\_S5` AML package in the DSDT is not parsed. QEMU's
-//! generated DSDT uses SLP_TYPa = 5, which is what we verify against;
-//! arbitrary vendor firmware may declare a different value.
+//! because the `\_S5` AML package in the DSDT is not parsed — an AML
+//! interpreter remains future work. The hardcoded value is SLP_TYPa = 0,
+//! which matches QEMU's generated DSDT (dumped via the QEMU monitor:
+//! `\_S5 = Package(4) {Zero, Zero, Zero, Zero}`) and is the only value
+//! verified here; vendor firmware declaring a different `\_S5` value will
+//! not power off (the write is simply ignored, no harm done).
 
 use core::arch::asm;
 use spin::Once;
