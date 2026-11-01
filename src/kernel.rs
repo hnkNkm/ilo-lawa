@@ -385,6 +385,14 @@ pub extern "C" fn kernel_main_owned() -> ! {
     x86_64::instructions::interrupts::enable();
     crate::terminal::print(" [OK]\n");
 
+    // Initialize the cooperative task scheduler (issue #18 stage 1). Task
+    // stacks are heap allocations and the scheduler is thread-context only,
+    // so this must come after the heap; from here on the main loop below
+    // drives the scheduler whenever tasks are ready.
+    crate::terminal::print("Initializing task scheduler...");
+    crate::task::init();
+    crate::terminal::print(" [OK]\n");
+
     // Initialize shell
     crate::shell::init();
 
@@ -392,7 +400,9 @@ pub extern "C" fn kernel_main_owned() -> ! {
     // context. Both queue locks are shared with ISRs, so they may only be
     // taken with interrupts disabled; both are popped and released before
     // any handler runs, and one item of EACH kind per iteration keeps a
-    // backlog on one input from starving the other. enable_and_hlt
+    // backlog on one input from starving the other. With no input pending,
+    // ready cooperative tasks (issue #18 stage 1) run before the loop halts;
+    // schedule() returns once the main task is running again. enable_and_hlt
     // (sti; hlt) closes the window where input could arrive between the
     // empty check and the halt.
     loop {
@@ -400,7 +410,14 @@ pub extern "C" fn kernel_main_owned() -> ! {
         let scancode = crate::keyboard::try_pop_scancode();
         let serial_byte = crate::serial::try_pop_input();
         match (scancode, serial_byte) {
-            (None, None) => x86_64::instructions::interrupts::enable_and_hlt(),
+            (None, None) => {
+                if crate::task::has_ready_tasks() {
+                    x86_64::instructions::interrupts::enable();
+                    crate::task::schedule();
+                } else {
+                    x86_64::instructions::interrupts::enable_and_hlt();
+                }
+            }
             (scancode, serial_byte) => {
                 x86_64::instructions::interrupts::enable();
                 if let Some(scancode) = scancode {
