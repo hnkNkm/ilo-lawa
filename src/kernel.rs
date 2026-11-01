@@ -2,6 +2,7 @@
 
 use core::arch::asm;
 use crate::font::get_char_bitmap;
+use spin::Once;
 
 // Framebuffer information that survives ExitBootServices
 #[derive(Clone, Copy)]
@@ -120,11 +121,24 @@ impl KernelGraphics {
     }
 }
 
-// The actual kernel entry point after ExitBootServices. The UEFI memory
-// map is retained here (see memory::init) rather than discarded.
-// `unreachable_code`: with feature `test-harness` the harness call below
-// diverges, so the remainder of the init sequence is unreachable there.
-#[allow(unreachable_code)]
+// Boot arguments parked by `kernel_main` before it abandons the firmware
+// stack; consumed by `kernel_main_owned` on the kernel-owned stack. The
+// memory map is moved exactly once — into this slot — and afterwards only
+// read through the shared reference; it is never dropped (the slot lives for
+// the kernel's lifetime, matching the "map is retained" contract).
+struct BootArgs {
+    fb_info: FramebufferInfo,
+    memory_map: uefi::table::boot::MemoryMap<'static>,
+}
+
+static BOOT_ARGS: Once<BootArgs> = Once::new();
+
+// The kernel entry point after ExitBootServices. Its only jobs are to park
+// the boot arguments and to switch from the firmware stack to the
+// kernel-owned stack (src/stacks.rs); the whole init sequence lives in
+// `kernel_main_owned`, so not a single init step runs on firmware stack
+// memory. No UEFI memory is reserved for the abandoned stack, so the frame
+// allocator (brought up later, in memory::init) starts from a clean slate.
 pub fn kernel_main(fb_info: FramebufferInfo, memory_map: uefi::table::boot::MemoryMap<'static>) -> ! {
     // CRITICAL: Disable interrupts immediately after ExitBootServices
     x86_64::instructions::interrupts::disable();
@@ -132,6 +146,38 @@ pub fn kernel_main(fb_info: FramebufferInfo, memory_map: uefi::table::boot::Memo
     // Bring up COM1 first so boot output reaches the host even before
     // the framebuffer terminal exists
     crate::serial::init();
+
+    // Park the boot arguments, then leave the firmware stack for good.
+    let firmware_rsp = crate::stacks::current_stack_pointer();
+    BOOT_ARGS.call_once(|| BootArgs { fb_info, memory_map });
+    let kernel_top = crate::stacks::main_stack_top();
+    crate::serial::print_fmt(format_args!(
+        "[stack] firmware rsp={:#x} -> kernel-owned stack top={:#x}, switching\n",
+        firmware_rsp, kernel_top
+    ));
+
+    // Safety: the boot arguments are parked above, and the continuation
+    // never returns.
+    unsafe { crate::stacks::switch_to_kernel_stack() }
+}
+
+// Continuation of kernel_main, running on the kernel-owned main stack
+// (entered via a `call` from stacks::switch_to_kernel_stack, so RSP follows
+// the normal call contract). The UEFI memory map is retained in BOOT_ARGS
+// (see memory::init) rather than discarded.
+// `unreachable_code`: with feature `test-harness` the harness call below
+// diverges, so the remainder of the init sequence is unreachable there.
+#[allow(unreachable_code)]
+pub extern "C" fn kernel_main_owned() -> ! {
+    let args = BOOT_ARGS
+        .get()
+        .expect("boot args must be parked before the stack switch");
+    let fb_info = args.fb_info;
+
+    crate::serial::print_fmt(format_args!(
+        "[stack] running on kernel-owned stack, rsp={:#x}\n",
+        crate::stacks::current_stack_pointer()
+    ));
 
     // Initialize terminal first
     crate::terminal::init(fb_info);
@@ -141,7 +187,14 @@ pub fn kernel_main(fb_info: FramebufferInfo, memory_map: uefi::table::boot::Memo
     crate::terminal::print("===================\n\n");
     crate::terminal::print("System Initialization:\n");
     crate::terminal::print("[OK] Interrupts disabled\n");
-    
+
+    // Install the kernel-owned identity page tables: guards the stack
+    // regions and marks the framebuffer MMIO uncached, before anything else
+    // allocates or maps memory (see src/paging.rs).
+    crate::terminal::print("Installing kernel page tables...");
+    crate::paging::init(fb_info, &args.memory_map);
+    crate::terminal::print(" [OK]\n");
+
     // Initialize heap allocator
     crate::terminal::print("Initializing heap allocator...");
     crate::allocator::init_heap();
@@ -170,7 +223,7 @@ pub fn kernel_main(fb_info: FramebufferInfo, memory_map: uefi::table::boot::Memo
     // Retain the UEFI memory map and bring up the physical frame
     // allocator (thread context, interrupts still disabled)
     crate::terminal::print("Initializing memory management...\n");
-    crate::memory::init(&memory_map);
+    crate::memory::init(&args.memory_map);
     crate::terminal::print(" [OK]\n");
 
     // Initialize filesystem BEFORE enabling interrupts: its allocations
