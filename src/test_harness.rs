@@ -35,15 +35,16 @@ type TestFn = fn() -> Result<(), String>;
 
 /// (name, function) pairs, run in order. `fs_crud` must run before
 /// `path_normalization`: both use `/harness-dir` and each cleans up after
-/// itself. `keyboard_decode` is a pure state-machine test with no
-/// resource or ordering constraints.
-static TESTS: [(&str, TestFn); 6] = [
+/// itself. `keyboard_decode` and `framebuffer_format` are pure tests with
+/// no resource or ordering constraints.
+static TESTS: [(&str, TestFn); 7] = [
     ("heap_churn", test_heap_churn),
     ("frame_allocator", test_frame_allocator),
     ("fs_crud", test_fs_crud),
     ("path_normalization", test_path_normalization),
     ("error_formatting", test_error_formatting),
     ("keyboard_decode", test_keyboard_decode),
+    ("framebuffer_format", test_framebuffer_format),
 ];
 
 /// Run all tests and exit QEMU with the aggregate status. Diverges.
@@ -424,6 +425,87 @@ fn test_keyboard_decode() -> Result<(), String> {
     )?;
     // Ctrl with an unbound character produces no event.
     expect(&[0x1D, 0x1E], None, "ctrl a unbound")?;
+
+    Ok(())
+}
+
+/// Pixel-format encoding (issue #11): a 0x00RRGGBB color must map to the
+/// exact native u32 each framebuffer layout expects. Pure functions on
+/// `kernel::PixelFormat` — no framebuffer, GOP, or hardware dependency.
+fn test_framebuffer_format() -> Result<(), String> {
+    use crate::kernel::{PixelFormat, encode_pixel};
+
+    const GREEN: u32 = 0x00FF00;
+    const RED: u32 = 0xFF0000;
+    const BLUE: u32 = 0x0000FF;
+    const WHITE: u32 = 0xFFFFFF;
+
+    // Bgr (QEMU's default GOP format): the value is written unchanged.
+    let bgr = PixelFormat::Bgr;
+    for (rgb, want) in [(GREEN, GREEN), (RED, RED), (BLUE, BLUE), (WHITE, WHITE)] {
+        let got = encode_pixel(&bgr, rgb);
+        if got != want {
+            return Err(format!("Bgr {rgb:#08x}: got {got:#08x}, want {want:#08x}"));
+        }
+    }
+
+    // Rgb: red and blue are swapped, green stays in place.
+    let rgb = PixelFormat::Rgb;
+    for (rgb_in, want) in [
+        (GREEN, GREEN),
+        (RED, BLUE),
+        (BLUE, RED),
+        (WHITE, WHITE),
+    ] {
+        let got = encode_pixel(&rgb, rgb_in);
+        if got != want {
+            return Err(format!("Rgb {rgb_in:#08x}: got {got:#08x}, want {want:#08x}"));
+        }
+    }
+
+    // Bitmask with full 8-bit channels (plus reserved bits at the top):
+    // must behave exactly like Bgr.
+    let mask32 = PixelFormat::Bitmask {
+        red_mask: 0x00FF_0000,
+        green_mask: 0x0000_FF00,
+        blue_mask: 0x0000_00FF,
+    };
+    for (rgb_in, want) in [(GREEN, GREEN), (RED, RED), (BLUE, BLUE), (WHITE, WHITE)] {
+        let got = encode_pixel(&mask32, rgb_in);
+        if got != want {
+            return Err(format!("Bitmask32 {rgb_in:#08x}: got {got:#08x}, want {want:#08x}"));
+        }
+    }
+
+    // Bitmask with non-8-bit channels, 16 bpp 5/6/5: each channel is scaled
+    // from 0..=255 to the full mask width and aligned to its lowest set bit.
+    let mask565 = PixelFormat::Bitmask {
+        red_mask: 0xF800,
+        green_mask: 0x07E0,
+        blue_mask: 0x001F,
+    };
+    for (rgb_in, want) in [
+        (RED, 31 << 11),
+        (GREEN, 63 << 5),
+        (BLUE, 31),
+        (WHITE, 0xFFFF),
+    ] {
+        let got = encode_pixel(&mask565, rgb_in);
+        if got != want {
+            return Err(format!("Bitmask565 {rgb_in:#08x}: got {got:#08x}, want {want:#08x}"));
+        }
+    }
+
+    // Zero-width masks are safe and contribute nothing.
+    let mask_zero = PixelFormat::Bitmask {
+        red_mask: 0,
+        green_mask: 0x0000_FF00,
+        blue_mask: 0,
+    };
+    let got = encode_pixel(&mask_zero, WHITE);
+    if got != 0x0000_FF00 {
+        return Err(format!("Bitmask zero-width: got {got:#08x}, want 0x0000ff00"));
+    }
 
     Ok(())
 }

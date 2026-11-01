@@ -47,6 +47,7 @@ fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     
     // Get GOP and framebuffer info BEFORE ExitBootServices
     let fb_info = {
+        use uefi::proto::console::gop::PixelFormat as UefiPixelFormat;
         let bt = system_table.boot_services();
         let gop_handle = bt.get_handle_for_protocol::<GraphicsOutput>()
             .expect("Failed to get GOP handle");
@@ -54,16 +55,60 @@ fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             .expect("Failed to open GOP");
         
         let mode_info = gop.current_mode_info();
-        let mut framebuffer = gop.frame_buffer();
-        
+
+        // Kernel-owned copy of the pixel format (the `uefi` crate type is
+        // unusable after ExitBootServices). Bitmask modes carry the
+        // per-channel masks in the mode info; a missing mask is a firmware
+        // defect, handled by encoding with all-zero (no-op) masks.
+        let pixel_format = match mode_info.pixel_format() {
+            UefiPixelFormat::Rgb => kernel::PixelFormat::Rgb,
+            UefiPixelFormat::Bgr => kernel::PixelFormat::Bgr,
+            UefiPixelFormat::Bitmask => match mode_info.pixel_bitmask() {
+                Some(mask) => kernel::PixelFormat::Bitmask {
+                    red_mask: mask.red,
+                    green_mask: mask.green,
+                    blue_mask: mask.blue,
+                },
+                None => kernel::PixelFormat::Bitmask {
+                    red_mask: 0,
+                    green_mask: 0,
+                    blue_mask: 0,
+                },
+            },
+            UefiPixelFormat::BltOnly => kernel::PixelFormat::BltOnly,
+        };
+
+        // In a Blt-only mode no linear framebuffer exists at all; never
+        // dereference one. (uefi's frame_buffer() would also assert.)
+        let base_address = if pixel_format == kernel::PixelFormat::BltOnly {
+            0
+        } else {
+            gop.frame_buffer().as_mut_ptr() as u64
+        };
+
         // Save framebuffer info that will survive ExitBootServices
         FramebufferInfo {
-            base_address: framebuffer.as_mut_ptr() as u64,
+            base_address,
             width: mode_info.resolution().0,
             height: mode_info.resolution().1,
             stride: mode_info.stride(),
+            pixel_format,
         }
     };
+
+    // Without a linear framebuffer the kernel cannot draw; stop here on the
+    // firmware's stdout instead of entering the kernel and faulting on the
+    // first clear().
+    if fb_info.pixel_format == kernel::PixelFormat::BltOnly {
+        system_table
+            .stdout()
+            .output_string(cstr16!(
+                "ERROR: GOP reports BltOnly (no linear framebuffer). \
+                ilo-lawa requires direct framebuffer access.\r\n"
+            ))
+            .ok();
+        return Status::UNSUPPORTED;
+    }
     
     system_table
         .stdout()
