@@ -4,6 +4,81 @@ use core::arch::asm;
 use crate::font::get_char_bitmap;
 use spin::Once;
 
+// Kernel-owned copy of the UEFI GOP pixel format. Exists so kernel drawing
+// never depends on the `uefi` crate type (which is unusable after
+// ExitBootServices anyway). Captured in src/main.rs before EBS.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PixelFormat {
+    /// 32 bpp; memory byte order B,G,R,reserved (QEMU's default GOP format).
+    /// Writing a little-endian u32 0x00RRGGBB as-is is correct here.
+    Bgr,
+    /// 32 bpp; memory byte order R,G,B,reserved. Red and blue are swapped
+    /// relative to Bgr.
+    Rgb,
+    /// Custom format described by per-channel bitmasks. Zero-width masks
+    /// (no bits for a channel) are allowed and simply contribute nothing.
+    Bitmask {
+        red_mask: u32,
+        green_mask: u32,
+        blue_mask: u32,
+    },
+    /// No linear framebuffer exists (Blt-only GOP mode). The bootloader
+    /// refuses to enter the kernel in this mode, so drawing never sees it.
+    BltOnly,
+}
+
+/// Encode a 0x00RRGGBB color into the native pixel value `format` expects.
+///
+/// - `Bgr`: the value is written unchanged (byte 0 = blue, matching the
+///   current 32 bpp BGRX behavior).
+/// - `Rgb`: red and blue bytes are swapped.
+/// - `Bitmask`: each 8-bit channel is extracted, aligned to its mask's
+///   lowest set bit, and scaled from 0..=255 to the mask's full width.
+///   Zero masks contribute 0 (safe, no shift-by-64 or division by zero).
+/// - `BltOnly`: unreachable in the kernel; returns 0.
+pub fn encode_pixel(format: &PixelFormat, rgb: u32) -> u32 {
+    let r = ((rgb >> 16) & 0xFF) as u8;
+    let g = ((rgb >> 8) & 0xFF) as u8;
+    let b = (rgb & 0xFF) as u8;
+    match *format {
+        PixelFormat::Bgr => rgb & 0x00FF_FFFF,
+        PixelFormat::Rgb => {
+            (u32::from(b) << 16) | (rgb & 0x0000_FF00) | u32::from(r)
+        }
+        PixelFormat::Bitmask {
+            red_mask,
+            green_mask,
+            blue_mask,
+        } => {
+            encode_channel(r, red_mask)
+                | encode_channel(g, green_mask)
+                | encode_channel(b, blue_mask)
+        }
+        PixelFormat::BltOnly => 0,
+    }
+}
+
+/// Scale an 8-bit `channel` onto the contiguous bit `mask` (per the UEFI
+/// spec masks are contiguous), aligned to the mask's lowest set bit.
+/// Returns 0 for a zero-width mask.
+fn encode_channel(channel: u8, mask: u32) -> u32 {
+    if mask == 0 {
+        return 0;
+    }
+    let shift = mask.trailing_zeros();
+    // Width of the contiguous run starting at the lowest set bit: the
+    // shifted mask's bit width.
+    let width = 32 - (mask >> shift).leading_zeros();
+    let max = if width >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << width) - 1
+    };
+    // Best-fit scale 0..=255 -> 0..=max (exact identity for max == 255);
+    // 64-bit math because channel * max can exceed u32.
+    (((u32::from(channel) as u64 * max as u64) / 255) as u32) << shift
+}
+
 // Framebuffer information that survives ExitBootServices
 #[derive(Clone, Copy)]
 pub struct FramebufferInfo {
@@ -11,6 +86,7 @@ pub struct FramebufferInfo {
     pub width: usize,
     pub height: usize,
     pub stride: usize,
+    pub pixel_format: PixelFormat,
 }
 
 // Loaded-image bounds captured before ExitBootServices (LoadedImage
@@ -33,19 +109,22 @@ impl KernelGraphics {
     }
     
     pub fn clear(&self, color: u32) {
-        unsafe {
-            let fb = self.fb_info.base_address as *mut u32;
-            for i in 0..(self.fb_info.height * self.fb_info.stride) {
-                *fb.add(i) = color;
-            }
+        // Encode once; every written pixel gets the same native value.
+        let color = encode_pixel(&self.fb_info.pixel_format, color);
+        let fb = self.fb_info.base_address as *mut u32;
+        for i in 0..(self.fb_info.height * self.fb_info.stride) {
+            // Volatile: the framebuffer is UC-mapped MMIO; the compiler
+            // must not elide or reorder these stores.
+            unsafe { fb.add(i).write_volatile(color) };
         }
     }
 
     /// Shift the whole framebuffer up by `pixels` scanlines and fill the
     /// newly exposed bottom strip with `fill_color`. Used for text scrolling:
     /// the caller passes CHAR_HEIGHT + LINE_SPACING so exactly one text row
-    /// moves up. Everything above the strip is moved with `core::ptr::copy`
-    /// (memmove), which is defined for the overlapping ranges we get here.
+    /// moves up. Everything above the strip is moved one u32 at a time with
+    /// volatile reads/writes — the framebuffer is UC-mapped MMIO, so
+    /// `core::ptr::copy` (non-volatile memmove) must not be used.
     pub fn scroll_up(&self, pixels: usize, fill_color: u32) {
         let width = self.fb_info.width;
         let height = self.fb_info.height;
@@ -61,14 +140,16 @@ impl KernelGraphics {
         }
 
         let fb = self.fb_info.base_address as *mut u32;
+        // Move everything below the scrolled-off strip up, pixel by pixel.
+        // One u32 per pixel; `stride` covers the padding between rows too.
+        // Scrolling up means destination < source, so a forward walk copies
+        // correctly even with the overlapping ranges.
         unsafe {
-            // Move everything below the scrolled-off strip up as one block.
-            // One u32 per pixel; `stride` covers the padding between rows too.
-            core::ptr::copy(
-                fb.add(pixels * stride),
-                fb,
-                (height - pixels) * stride,
-            );
+            let src = fb.add(pixels * stride);
+            for i in 0..(height - pixels) * stride {
+                let pixel = src.add(i).read_volatile();
+                fb.add(i).write_volatile(pixel);
+            }
         }
 
         // Clear the strip that was exposed at the bottom.
@@ -80,10 +161,11 @@ impl KernelGraphics {
             return;
         }
         
+        let native = encode_pixel(&self.fb_info.pixel_format, color);
         unsafe {
             let fb = self.fb_info.base_address as *mut u32;
             let offset = y * self.fb_info.stride + x;
-            *fb.add(offset) = color;
+            fb.add(offset).write_volatile(native);
         }
     }
     
