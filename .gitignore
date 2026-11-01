@@ -6,8 +6,12 @@ Cargo.lock
 
 # UEFI build artifacts
 /esp/
+/ovmf
 /ovmf/
 *.efi
+
+# virtio-blk data disk (make disk, issue #14)
+/disk.img
 
 # Nix
 /result

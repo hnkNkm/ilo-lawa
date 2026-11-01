@@ -1,8 +1,12 @@
 //! PCI bus enumeration and configuration-space access via the legacy
 //! 0xCF8/0xCFC mechanism (no MMCONFIG/ECAM; that needs ACPI MCFG and is
 //! future work). This is the discovery layer for virtio-blk (issue #14),
-//! NIC, NVMe and xHCI drivers; it only *reports* devices — no bus
-//! mastering, no BAR mapping, no driver initialization happens here.
+//! NIC, NVMe and xHCI drivers. Enumeration is read-only; the only
+//! configuration-space *write* is [`enable_device`], which flips the
+//! command-register bits a driver needs (I/O + memory decode, bus
+//! mastering for DMA). BAR mapping stays with the device drivers: the
+//! legacy virtio transport uses an I/O-port BAR and needs no page-table
+//! work at all.
 //!
 //! Locking: `PCI_BUS` is thread-context only (kernel init and the `lspci`
 //! shell command both run in the main loop), exactly like `SHELL` and
@@ -128,6 +132,35 @@ fn config_read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
         address.write(config_address(bus, device, function, offset));
         data.read()
     }
+}
+
+// Command register (offset 0x04) bits a driver needs before it may touch
+// the device: BAR decode enable and DMA permission.
+const COMMAND_IO_SPACE: u32 = 1 << 0;
+const COMMAND_MEMORY_SPACE: u32 = 1 << 1;
+const COMMAND_BUS_MASTER: u32 = 1 << 2;
+
+/// Write one aligned dword of configuration space.
+fn config_write32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    let mut address = Port::new(CONFIG_ADDRESS);
+    let mut data = Port::new(CONFIG_DATA);
+    unsafe {
+        address.write(config_address(bus, device, function, offset));
+        data.write(value);
+    }
+}
+
+/// Enable `device` for driver use: read-modify-write the command register
+/// so I/O-space and memory-space BAR decode are on and the device may act
+/// as bus master (required for DMA; virtio queues and data buffers are
+/// device-accessed memory). Unrelated command bits (e.g. SERR#, INTx
+/// disable) are preserved. Thread context only, like all of this module.
+pub fn enable_device(device: &PciDevice) {
+    let bdf = (device.bus, device.device, device.function);
+    let command = config_read32(bdf.0, bdf.1, bdf.2, 0x04);
+    let enabled =
+        command | COMMAND_IO_SPACE | COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER;
+    config_write32(bdf.0, bdf.1, bdf.2, 0x04, enabled);
 }
 
 /// Read one function's header into a `PciDevice`, or `None` for an absent
