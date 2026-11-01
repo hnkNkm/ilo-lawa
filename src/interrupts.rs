@@ -27,7 +27,7 @@ lazy_static! {
         // even when masked, and a non-present gate would fault (issue #6)
         idt[34].set_handler_fn(irq2_handler);
         idt[35].set_handler_fn(irq3_handler);
-        idt[36].set_handler_fn(irq4_handler);
+        idt[36].set_handler_fn(serial_interrupt_handler);
         idt[37].set_handler_fn(irq5_handler);
         idt[38].set_handler_fn(irq6_handler);
         idt[39].set_handler_fn(spurious_irq7_handler);
@@ -131,7 +131,6 @@ macro_rules! pic_eoi_handlers {
 pic_eoi_handlers! {
     irq2_handler => 34,
     irq3_handler => 35,
-    irq4_handler => 36,
     irq5_handler => 37,
     irq6_handler => 38,
     irq8_handler => 40,
@@ -141,6 +140,17 @@ pic_eoi_handlers! {
     irq12_handler => 44,
     irq13_handler => 45,
     irq14_handler => 46,
+}
+
+extern "x86-interrupt" fn serial_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Drain received COM1 bytes into the RX queue. UART reads only: the
+    // TX lock may be held by interrupted printing code, so no serial
+    // print and no terminal output from this path (issue #2 rules).
+    crate::serial::service_rx_interrupt();
+
+    unsafe {
+        pic::PICS.lock().notify_end_of_interrupt(InterruptIndex::Serial.as_u8());
+    }
 }
 
 extern "x86-interrupt" fn spurious_irq7_handler(_stack_frame: InterruptStackFrame) {
@@ -172,6 +182,7 @@ extern "x86-interrupt" fn spurious_irq15_handler(_stack_frame: InterruptStackFra
 pub enum InterruptIndex {
     Timer = pic::PIC_1_OFFSET,
     Keyboard = pic::PIC_1_OFFSET + 1,
+    Serial = pic::PIC_1_OFFSET + 4,
 }
 
 impl InterruptIndex {

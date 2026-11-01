@@ -353,15 +353,19 @@ pub extern "C" fn kernel_main_owned() -> ! {
     // Initialize shell
     crate::shell::init();
 
-    // Main kernel loop: drain the scancode queue in thread context.
-    // The queue lock is shared with the keyboard ISR, so it may only be
+    // Main kernel loop: drain the scancode and serial RX queues in thread
+    // context. Both queue locks are shared with ISRs, so they may only be
     // taken with interrupts disabled; enable_and_hlt (sti; hlt) closes
-    // the window where a scancode could arrive between check and halt.
+    // the window where input could arrive between check and halt. One
+    // item per iteration keeps neither queue starved.
     loop {
         x86_64::instructions::interrupts::disable();
         if let Some(scancode) = crate::keyboard::try_pop_scancode() {
             x86_64::instructions::interrupts::enable();
             crate::keyboard::handle_scancode(scancode);
+        } else if let Some(byte) = crate::serial::try_pop_input() {
+            x86_64::instructions::interrupts::enable();
+            crate::serial::handle_input(byte);
         } else {
             x86_64::instructions::interrupts::enable_and_hlt();
         }

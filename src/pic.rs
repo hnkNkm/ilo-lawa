@@ -79,9 +79,9 @@ impl ChainedPics {
         self.pics[1].data.write(MODE_8086);
         wait();
         
-        // Enable keyboard and timer interrupts only
-        // 0xFC = 11111100 - enables IRQ0 (timer) and IRQ1 (keyboard)
-        self.pics[0].write_mask(0xFC);
+        // Enable keyboard, timer, and COM1 serial interrupts
+        // 0xEC = 11101100 - enables IRQ0 (timer), IRQ1 (keyboard), IRQ4 (COM1)
+        self.pics[0].write_mask(0xEC);
         self.pics[1].write_mask(0xFF);
     }
     
