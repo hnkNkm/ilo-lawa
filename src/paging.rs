@@ -52,8 +52,8 @@ use crate::kernel::{FramebufferInfo, ImageInfo};
 /// (`memory::MAX_SUPPORTED_PHYS` = 4 GiB); the extra two are defensive
 /// headroom for firmware that loads the kernel image at (or near) the PE
 /// preferred base 0x140000000 = 5 GiB instead of relocating it low like
-/// OVMF does. Stage 2b will narrow the map to the exact image bounds via
-/// LoadedImage.
+/// OVMF does. Stage 2b keeps this window and only splits the image-
+/// overlapping PDEs into 4 KiB page tables (see `apply_wx`).
 const PD_COUNT: usize = 6;
 const HUGE_PAGE: u64 = 1 << 21;
 const PDE_COUNT: usize = 512 * PD_COUNT;
@@ -78,8 +78,8 @@ static OLD_CR3: AtomicU64 = AtomicU64::new(0);
 /// Spare 4 KiB page tables for the stage-2b W^X split: every 2 MiB PDE
 /// overlapping the loaded image gets its own PT so code can be RX and data
 /// NX at 4 KiB granularity. 16 PTs cover a 32 MiB image allocation — the
-/// current kernel image (with ~12 MiB of .bss stack storage per region) is
-/// ~26 MiB. If a future image outgrows the pool, W^X is skipped entirely
+/// current image is ~13.4 MiB (0x1d465000..0x1e1be000 under QEMU/OVMF) and
+/// needs 5 PTs. If a future image outgrows the pool, W^X is skipped entirely
 /// (stage-2a map stays intact) rather than half-applied.
 const PT_POOL_SIZE: usize = 16;
 static mut PT_POOL: [AlignedPageTable; PT_POOL_SIZE] = [
@@ -332,24 +332,36 @@ fn alloc_pt() -> *mut PageTable {
     unsafe { &raw mut PT_POOL[i].0 }
 }
 
-/// Apply W^X for `image` on top of the flat stage-2a map. Skips entirely
-/// (map left untouched, no NX anywhere) when the image info is missing,
-/// malformed, or too large for the PT pool. Runs before the CR3 switch,
-/// with interrupts disabled.
-fn apply_wx(image: ImageInfo) {
+/// Apply W^X for `image` on top of the flat stage-2a map. Returns true when
+/// W^X was fully applied; skips entirely — map left untouched, no NX
+/// anywhere, caller must not publish the image bounds — when the image info
+/// is missing, malformed, or outside the mapped window. Runs before the CR3
+/// switch, with interrupts disabled.
+fn apply_wx(image: ImageInfo) -> bool {
     if image.base == 0 || image.size == 0 {
         crate::serial::print(
             "[pt] W^X skipped: image info unavailable (LoadedImage open failed)\n",
         );
-        return;
+        return false;
     }
     let Some(plan) = parse_pe(image.base, image.size) else {
         crate::serial::print_fmt(format_args!(
             "[pt] W^X skipped: PE headers at {:#x} (size {:#x}) failed validation\n",
             image.base, image.size
         ));
-        return;
+        return false;
     };
+    // The whole allocation must sit inside the mapped 0..6 GiB window:
+    // pde_for() indexes PDS, and an allocation straddling the window edge
+    // (e.g. a non-relocating loader near 5 GiB + 32 MiB) would run past it.
+    let map_limit = (PD_COUNT as u64) << 30;
+    if plan.image_base >= map_limit || plan.image_end > map_limit {
+        crate::serial::print_fmt(format_args!(
+            "[pt] W^X skipped: image {:#x}..{:#x} outside the mapped window (limit {:#x})\n",
+            plan.image_base, plan.image_end, map_limit
+        ));
+        return false;
+    }
 
     // Pre-flight: every 2 MiB PDE overlapping the image needs one PT,
     // except guard PDEs (left non-present, never split — the stack regions'
@@ -381,7 +393,7 @@ fn apply_wx(image: ImageInfo) {
             "[pt] W^X skipped: image needs {} page tables, {} available\n",
             required, PT_POOL_SIZE
         ));
-        return;
+        return false;
     }
 
     crate::serial::print_fmt(format_args!(
@@ -450,6 +462,7 @@ fn apply_wx(image: ImageInfo) {
         splits
     ));
     wx_self_check();
+    true
 }
 
 /// Per-leaf-class counts for the W^X self-check.
@@ -626,10 +639,12 @@ pub fn init(fb_info: FramebufferInfo, memory_map: &MemoryMap<'static>, image: Im
     // Stage 2b: EFER.NXE + W^X. Splits the image PDEs into 4 KiB PTs
     // (code RX, headers/readonly NX, data NX), marks every remaining flat
     // leaf NX, and verifies no leaf is writable+executable. Leaves the
-    // stage-2a map untouched when the image info is missing or invalid.
-    apply_wx(image);
-    WX_IMAGE_BASE.store(image.base, Ordering::Relaxed);
-    WX_IMAGE_SIZE.store(image.size, Ordering::Relaxed);
+    // stage-2a map untouched when the image info is missing or invalid;
+    // the probe-visible bounds stay (0,0) whenever W^X did not apply.
+    if apply_wx(image) {
+        WX_IMAGE_BASE.store(image.base, Ordering::Relaxed);
+        WX_IMAGE_SIZE.store(image.size, Ordering::Relaxed);
+    }
 
     // Switch CR3. `mov cr3` architecturally invalidates every non-global TLB
     // entry (PGE is off, GLOBAL unused), so no explicit flush is needed.
