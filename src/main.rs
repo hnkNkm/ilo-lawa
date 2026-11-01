@@ -15,6 +15,7 @@ mod gdt;
 mod interrupts;
 mod pic;
 mod time;
+mod rtc;
 mod keyboard;
 mod terminal;
 mod serial;

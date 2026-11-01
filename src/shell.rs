@@ -221,6 +221,7 @@ impl Shell {
             "echo" => self.cmd_echo(args),
             "version" => self.cmd_version(),
             "uptime" => self.cmd_uptime(),
+            "date" => self.cmd_date(),
             "sleep" => self.cmd_sleep(args),
             "history" => self.cmd_history(),
             "shutdown" => self.cmd_shutdown(),
@@ -282,6 +283,7 @@ impl Shell {
         crate::terminal::print("  echo     - Print arguments to screen\n");
         crate::terminal::print("  version  - Show OS version\n");
         crate::terminal::print("  uptime   - Show system uptime\n");
+        crate::terminal::print("  date     - Show RTC date and time (YYYY-MM-DD HH:MM:SS)\n");
         crate::terminal::print("  sleep    - Sleep for <ms> milliseconds\n");
         crate::terminal::print("  history  - Show command history\n");
         crate::terminal::print("  shutdown - Shutdown the system\n");
@@ -406,6 +408,32 @@ impl Shell {
         crate::terminal::print_char(':');
         print_two_digits(secs);
         crate::terminal::print_char('\n');
+    }
+
+    fn cmd_date(&self) {
+        match crate::rtc::now() {
+            Some(dt) => {
+                // YYYY-MM-DD HH:MM:SS, decimal digits printed directly —
+                // no floats, no format! allocations. Whatever the CMOS RTC
+                // holds is printed as-is (no timezone conversion); the
+                // boot snapshot is extrapolated by PIT ticks (issue #20).
+                print_u64(u64::from(dt.year));
+                crate::terminal::print_char('-');
+                print_two_digits(u64::from(dt.month));
+                crate::terminal::print_char('-');
+                print_two_digits(u64::from(dt.day));
+                crate::terminal::print_char(' ');
+                print_two_digits(u64::from(dt.hour));
+                crate::terminal::print_char(':');
+                print_two_digits(u64::from(dt.minute));
+                crate::terminal::print_char(':');
+                print_two_digits(u64::from(dt.second));
+                crate::terminal::print_char('\n');
+            }
+            None => {
+                crate::terminal::print("date: RTC unavailable (no valid CMOS wall clock)\n");
+            }
+        }
     }
 
     fn cmd_sleep(&self, args: &[&str]) {

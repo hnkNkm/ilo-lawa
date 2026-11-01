@@ -370,6 +370,16 @@ pub extern "C" fn kernel_main_owned() -> ! {
     crate::time::init();
     crate::terminal::print(" [OK]\n");
 
+    // Take the wall-clock snapshot from the CMOS RTC (issue #20): `date`
+    // later extrapolates it with PIT ticks. Plain port I/O in thread
+    // context — no locks held, and interrupts are still disabled, so no
+    // ISR can interleave (none touches the CMOS anyway).
+    crate::terminal::print("Reading RTC wall clock...");
+    match crate::rtc::init() {
+        Some(_) => crate::terminal::print(" [OK]\n"),
+        None => crate::terminal::print(" unavailable\n"),
+    }
+
     // Test harness (feature "test-harness"): with the filesystem and PIT
     // up and interrupts still disabled, run the kernel self-tests and exit
     // QEMU through isa-debug-exit before interrupts, shell, or the main
