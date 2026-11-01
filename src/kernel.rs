@@ -187,7 +187,14 @@ pub extern "C" fn kernel_main_owned() -> ! {
     crate::terminal::print("===================\n\n");
     crate::terminal::print("System Initialization:\n");
     crate::terminal::print("[OK] Interrupts disabled\n");
-    
+
+    // Install the kernel-owned identity page tables: guards the stack
+    // regions and marks the framebuffer MMIO uncached, before anything else
+    // allocates or maps memory (see src/paging.rs).
+    crate::terminal::print("Installing kernel page tables...");
+    crate::paging::init(fb_info, &args.memory_map);
+    crate::terminal::print(" [OK]\n");
+
     // Initialize heap allocator
     crate::terminal::print("Initializing heap allocator...");
     crate::allocator::init_heap();
