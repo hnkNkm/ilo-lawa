@@ -226,6 +226,8 @@ impl Shell {
             "shutdown" => self.cmd_shutdown(),
             "reboot" => self.cmd_reboot(),
             "lspci" => self.cmd_lspci(args),
+            "tasks" => self.cmd_tasks(),
+            "taskdemo" => self.cmd_taskdemo(),
             // Filesystem commands with unified argument handling
             "ls" => self.cmd_ls(self.get_first_arg(args, "")),
             "cd" => self.cmd_cd(self.get_first_arg(args, "/")),
@@ -285,6 +287,8 @@ impl Shell {
         crate::terminal::print("  shutdown - Shutdown the system\n");
         crate::terminal::print("  reboot   - Reboot the system\n");
         crate::terminal::print("  lspci    - List PCI devices (-v for details)\n");
+        crate::terminal::print("  tasks    - List tasks (id, name, state)\n");
+        crate::terminal::print("  taskdemo - Spawn demo/stress/counter/sleeper tasks\n");
         crate::terminal::print("\nFilesystem Commands:\n");
         crate::terminal::print("  ls       - List directory contents\n");
         crate::terminal::print("  cd       - Change directory\n");
@@ -467,6 +471,44 @@ impl Shell {
         // FADT reset register, then the 8042 keyboard controller (see
         // src/acpi.rs); halts when both fail.
         crate::acpi::reboot();
+    }
+
+    /// List every task in the scheduler table (id, name, state), marking the
+    /// currently running one. Thread context; the snapshot allocates, which
+    /// is fine here but would be forbidden in an ISR.
+    fn cmd_tasks(&self) {
+        let (tasks, current) = crate::task::snapshot();
+        if tasks.is_empty() {
+            crate::terminal::print("No tasks (scheduler not initialized?).\n");
+            return;
+        }
+        crate::terminal::print("ID   NAME        STATE\n");
+        for (id, name, state) in tasks {
+            let marker = if id == current { "*" } else { " " };
+            crate::terminal::print_fmt(format_args!(
+                "{}{:<4} {:<11} {:?}\n",
+                marker, id, name, state
+            ));
+        }
+    }
+
+    /// Spawn the demo task suite (demo/stress/counter/sleeper, see
+    /// task::demo) and return immediately: the tasks are only queued here —
+    /// the main loop runs them once this command handler has returned and the
+    /// SHELL lock is released, which is why nothing here may wait for them.
+    fn cmd_taskdemo(&self) {
+        match crate::task::demo::spawn_suite(true) {
+            Ok(()) => {
+                crate::terminal::print(
+                    "taskdemo: spawned demo, stress, counter, sleeper — 4 tasks ready\n",
+                );
+            }
+            Err(e) => {
+                crate::terminal::print("taskdemo: spawn failed: ");
+                crate::terminal::print(e);
+                crate::terminal::print("\n");
+            }
+        }
     }
     
     // Filesystem commands

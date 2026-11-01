@@ -37,7 +37,7 @@ type TestFn = fn() -> Result<(), String>;
 /// `path_normalization`: both use `/harness-dir` and each cleans up after
 /// itself. `keyboard_decode` and `framebuffer_format` are pure tests with
 /// no resource or ordering constraints.
-static TESTS: [(&str, TestFn); 7] = [
+static TESTS: [(&str, TestFn); 8] = [
     ("heap_churn", test_heap_churn),
     ("frame_allocator", test_frame_allocator),
     ("fs_crud", test_fs_crud),
@@ -45,6 +45,7 @@ static TESTS: [(&str, TestFn); 7] = [
     ("error_formatting", test_error_formatting),
     ("keyboard_decode", test_keyboard_decode),
     ("framebuffer_format", test_framebuffer_format),
+    ("task_scheduler", test_task_scheduler),
 ];
 
 /// Run all tests and exit QEMU with the aggregate status. Diverges.
@@ -507,5 +508,102 @@ fn test_framebuffer_format() -> Result<(), String> {
         return Err(format!("Bitmask zero-width: got {got:#08x}, want 0x0000ff00"));
     }
 
+    Ok(())
+}
+
+/// Cooperative scheduler and context switch (issue #18 stage 1): spawn the
+/// `task::demo` suite and drive it to completion, with interrupts still
+/// disabled as everywhere else in the harness (schedule() preserves the
+/// interrupt state, so this works unchanged). The stress task forces 100
+/// yield rounds (200+ context switches through the hand-written switch) and
+/// the counter task must observe exactly one scheduling round per stress
+/// yield — any mis-saved register or misaligned stack desynchronizes the
+/// round-robin and shows up here. Also verifies first-run interrupt
+/// inheritance: the harness schedules with IF=0, so the fresh tasks must
+/// have started with interrupts DISABLED (the shell path proves the enabled
+/// case live: taskdemo's sleeper task sleeps on the IRQ-driven PIT). Verifies
+/// every task reaches Exited with the main task still current. The sleeper
+/// is NOT spawned here — `time::sleep_ms` with IF=0 would never wake.
+fn test_task_scheduler() -> Result<(), String> {
+    use crate::task::TaskState;
+
+    crate::task::init();
+
+    if crate::task::has_ready_tasks() {
+        return Err(format!("ready tasks exist before any spawn"));
+    }
+
+    crate::task::demo::spawn_suite(false).map_err(|e| format!("spawn failed: {}", e))?;
+    if !crate::task::has_ready_tasks() {
+        return Err(format!("spawned tasks are not Ready"));
+    }
+
+    // One iteration ≈ one round-robin round; the bound is generous slack
+    // over 100 rounds plus the three task exits.
+    for _ in 0..1_000 {
+        if !crate::task::has_ready_tasks() {
+            break;
+        }
+        crate::task::schedule();
+    }
+
+    let expected = crate::task::demo::STRESS_YIELD_COUNT;
+    let yields = crate::task::demo::stress_yields();
+    if yields != expected {
+        return Err(format!(
+            "stress yielded {} times, expected {}",
+            yields, expected
+        ));
+    }
+    let rounds = crate::task::demo::counter_rounds();
+    if rounds != expected {
+        return Err(format!(
+            "counter observed {} scheduling rounds, expected {} (round-robin desync)",
+            rounds, expected
+        ));
+    }
+    let lines = crate::task::demo::demo_lines();
+    if lines != 3 {
+        return Err(format!("demo printed {} lines, expected 3", lines));
+    }
+    if !crate::task::demo::stress_done() {
+        return Err(format!("stress task did not mark itself done"));
+    }
+    // First-run interrupt inheritance: the harness schedules with IF=0, so
+    // every fresh task must have observed interrupts disabled at entry.
+    match crate::task::demo::entry_interrupts_enabled() {
+        Some(false) => {}
+        other => {
+            return Err(format!(
+                "fresh tasks started with entry IF {:?}, expected Some(false) \
+                 (the harness scheduling context has interrupts disabled)",
+                other
+            ));
+        }
+    }
+    if crate::task::has_ready_tasks() {
+        return Err(format!("ready tasks remain after the suite finished"));
+    }
+
+    let (tasks, current) = crate::task::snapshot();
+    let exited = tasks
+        .iter()
+        .filter(|(_, _, state)| *state == TaskState::Exited)
+        .count();
+    if exited != 3 {
+        return Err(format!("{} exited tasks in the table, expected 3", exited));
+    }
+    if current != 0 {
+        return Err(format!(
+            "current task is #{}, expected the main task #0",
+            current
+        ));
+    }
+    if tasks[0].2 != TaskState::Running {
+        return Err(format!(
+            "main task state is {:?}, expected Running",
+            tasks[0].2
+        ));
+    }
     Ok(())
 }
