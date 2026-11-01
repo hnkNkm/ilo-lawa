@@ -518,8 +518,12 @@ fn test_framebuffer_format() -> Result<(), String> {
 /// yield rounds (200+ context switches through the hand-written switch) and
 /// the counter task must observe exactly one scheduling round per stress
 /// yield — any mis-saved register or misaligned stack desynchronizes the
-/// round-robin and shows up here. Verifies every task reaches Exited with
-/// the main task still current.
+/// round-robin and shows up here. Also verifies first-run interrupt
+/// inheritance: the harness schedules with IF=0, so the fresh tasks must
+/// have started with interrupts DISABLED (the shell path proves the enabled
+/// case live: taskdemo's sleeper task sleeps on the IRQ-driven PIT). Verifies
+/// every task reaches Exited with the main task still current. The sleeper
+/// is NOT spawned here — `time::sleep_ms` with IF=0 would never wake.
 fn test_task_scheduler() -> Result<(), String> {
     use crate::task::TaskState;
 
@@ -529,7 +533,7 @@ fn test_task_scheduler() -> Result<(), String> {
         return Err(format!("ready tasks exist before any spawn"));
     }
 
-    crate::task::demo::spawn_suite().map_err(|e| format!("spawn failed: {}", e))?;
+    crate::task::demo::spawn_suite(false).map_err(|e| format!("spawn failed: {}", e))?;
     if !crate::task::has_ready_tasks() {
         return Err(format!("spawned tasks are not Ready"));
     }
@@ -564,6 +568,18 @@ fn test_task_scheduler() -> Result<(), String> {
     }
     if !crate::task::demo::stress_done() {
         return Err(format!("stress task did not mark itself done"));
+    }
+    // First-run interrupt inheritance: the harness schedules with IF=0, so
+    // every fresh task must have observed interrupts disabled at entry.
+    match crate::task::demo::entry_interrupts_enabled() {
+        Some(false) => {}
+        other => {
+            return Err(format!(
+                "fresh tasks started with entry IF {:?}, expected Some(false) \
+                 (the harness scheduling context has interrupts disabled)",
+                other
+            ));
+        }
     }
     if crate::task::has_ready_tasks() {
         return Err(format!("ready tasks remain after the suite finished"));

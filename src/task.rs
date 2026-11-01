@@ -65,6 +65,17 @@
 //! - Task entries run in thread context and may use the terminal, serial, FS,
 //!   and the heap. They must NOT call into the shell or take the SHELL lock,
 //!   and they must never disable interrupts around a yield.
+//! - **Interrupt state of a task**: a RESUMED task restores the IF its own
+//!   `schedule()` call saved; a FRESH task never runs that epilogue, so it
+//!   inherits the IF of the context that first scheduled it (`start_if`,
+//!   applied by the trampoline) — enabled when spawned from the shell/main
+//!   loop, disabled when driven by the test harness. A task entry may
+//!   therefore be interrupted: IRQ handlers (timer/keyboard/serial) run and
+//!   return normally, but nothing is ever scheduled from an ISR (stage 2
+//!   would change that).
+//! - **Never yield while holding a lock another task can take**: a yield
+//!   with the terminal, serial-TX, FS, heap, or scheduler lock held can
+//!   deadlock the single CPU when the next task blocks on the same lock.
 //! - A task that panics is fatal (panic = abort; there is no task teardown).
 //!
 //! # Remaining gap (stage 2)
@@ -191,16 +202,24 @@ extern "C" {
 }
 
 /// Entry shim every fresh task starts in. Runs with the fresh task's brand-new
-/// stack (see the module docs for the exact entry state). Calls the task's
-/// entry, then exits the task — the stack below the trampoline frame is dead
-/// from here on and is reclaimed by the scheduler once some other task has
-/// switched away from it.
+/// stack (see the module docs for the exact entry state) and with the
+/// interrupt state the scheduling context recorded for the first run — a
+/// fresh task never executes `schedule()`'s epilogue, so it must restore its
+/// own IF here before the entry runs. Calls the task's entry, then exits the
+/// task — the stack below the trampoline frame is dead from here on and is
+/// reclaimed by the scheduler once some other task has switched away from it.
 #[no_mangle]
 extern "C" fn task_trampoline() -> ! {
-    let entry = {
-        let scheduler = SCHEDULER.lock();
-        scheduler.tasks[scheduler.current].entry
+    let (entry, start_if) = {
+        let mut scheduler = SCHEDULER.lock();
+        let current = scheduler.current;
+        let task = &mut scheduler.tasks[current];
+        task.started = true;
+        (task.entry, task.start_if)
     };
+    if start_if {
+        x86_64::instructions::interrupts::enable();
+    }
     entry();
     exit_current();
 }
@@ -268,6 +287,13 @@ struct Task {
     name: String,
     state: TaskState,
     entry: extern "C" fn(),
+    /// Whether the task has ever been switched to. A fresh (never-started)
+    /// task takes its interrupt state from the context that first schedules
+    /// it, because it never runs `schedule()`'s resume epilogue.
+    started: bool,
+    /// IF to restore for the first run; recorded by [`schedule`]/
+    /// [`exit_current`] at selection time and consumed by the trampoline.
+    start_if: bool,
     /// Owned 64 KiB stack; `None` once reaped (exited tasks only) or for the
     /// main task, which runs on the static kernel stack from `stacks.rs`.
     stack: Option<TaskStack>,
@@ -336,6 +362,8 @@ impl Scheduler {
                 // started through the trampoline (its "entry" is the main
                 // loop that called into the scheduler).
                 entry: main_task_entry,
+                started: true,
+                start_if: false, // never consulted; main resumes via epilogues
                 stack: None,
                 context: TaskContext {
                     rsp: 0,
@@ -429,6 +457,8 @@ pub fn spawn(name: &str, entry: extern "C" fn()) -> Result<TaskId, &'static str>
         name: String::from(name),
         state: TaskState::Ready,
         entry,
+        started: false,
+        start_if: false, // set at first selection, from the scheduling context
         stack: Some(stack),
         context: TaskContext {
             rsp: 0,
@@ -463,7 +493,13 @@ pub fn schedule() {
         let mut scheduler = SCHEDULER.lock();
         scheduler.reap_exited();
         let old = scheduler.current;
-        scheduler.pick_next().map(|_next| {
+        scheduler.pick_next().map(|next| {
+            // A task that has never run does not resume through a schedule()
+            // epilogue, so it inherits THIS scheduling context's interrupt
+            // state; the trampoline applies it before the entry.
+            if !scheduler.tasks[next].started {
+                scheduler.tasks[next].start_if = interrupts_were_enabled;
+            }
             // Raw pointers stay valid for this call: interrupts are disabled,
             // only thread context runs, and nothing can push to `tasks`
             // before task_switch completes.
@@ -495,6 +531,7 @@ pub fn yield_now() {
 /// caller's context — the stack is reclaimed once another schedule() reaps it.
 /// Only valid for spawned tasks; the main task (id 0) must never exit.
 fn exit_current() -> ! {
+    let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
     x86_64::instructions::interrupts::disable();
 
     let switch = {
@@ -504,7 +541,12 @@ fn exit_current() -> ! {
             panic!("the main task cannot exit");
         }
         scheduler.tasks[old].state = TaskState::Exited;
-        scheduler.pick_next().map(|_next| {
+        scheduler.pick_next().map(|next| {
+            // Same first-run rule as schedule(): a never-started pick
+            // inherits the exiting context's interrupt state.
+            if !scheduler.tasks[next].started {
+                scheduler.tasks[next].start_if = interrupts_were_enabled;
+            }
             // The exited task's context is dead; only the new task's context
             // (and the old rsp slot, written and immediately abandoned) is
             // touched by the switch.
@@ -563,11 +605,13 @@ pub fn snapshot() -> (Vec<(TaskId, String, TaskState)>, TaskId) {
 /// Background tasks spawned by the `taskdemo` shell command and reused by the
 /// test harness to verify the context switch under load: a demo task printing
 /// three numbered lines across yields, a stress task yielding
-/// [`STRESS_YIELD_COUNT`] times, and a counter task that wakes once per
-/// round-robin round until the stress task finishes.
+/// [`STRESS_YIELD_COUNT`] times, a counter task that wakes once per
+/// round-robin round until the stress task finishes, and (shell path only) a
+/// sleeper task that proves fresh tasks start with the scheduling context's
+/// interrupt state by blocking on the IRQ-driven PIT.
 pub mod demo {
     use super::{spawn, yield_now};
-    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
     /// How many times the stress task yields.
     pub const STRESS_YIELD_COUNT: u64 = 100;
@@ -576,6 +620,17 @@ pub mod demo {
     static STRESS_YIELDS: AtomicU64 = AtomicU64::new(0);
     static COUNTER_ROUNDS: AtomicU64 = AtomicU64::new(0);
     static STRESS_DONE: AtomicBool = AtomicBool::new(false);
+    /// IF as the entries saw it: 0 = no entry ran yet, 1 = disabled,
+    /// 2 = enabled. All entries record it as their first action; under
+    /// deterministic round-robin every entry sees the same state.
+    static IF_AT_ENTRY: AtomicU8 = AtomicU8::new(0);
+
+    /// Record the interrupt state this entry started with. First action of
+    /// every entry in the suite.
+    fn record_entry_if() {
+        let enabled = x86_64::instructions::interrupts::are_enabled();
+        IF_AT_ENTRY.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+    }
 
     // Test-only observability: the in-kernel harness asserts on these
     // counters; normal builds never read them.
@@ -604,17 +659,37 @@ pub mod demo {
         STRESS_DONE.load(Ordering::Relaxed)
     }
 
-    /// Spawn the three-task suite (demo, stress, counter), all Ready.
-    pub fn spawn_suite() -> Result<(), &'static str> {
+    /// The interrupt state the fresh tasks started with: `Some(false)` when
+    /// every entry saw interrupts disabled, `Some(true)` when enabled,
+    /// `None` when no entry ran (or the values disagreed, which itself
+    /// indicates a start_if bug).
+    #[cfg(feature = "test-harness")]
+    pub fn entry_interrupts_enabled() -> Option<bool> {
+        match IF_AT_ENTRY.load(Ordering::Relaxed) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Spawn the task suite, all Ready: demo, stress, counter, and — on the
+    /// shell path only (`include_sleeper`) — a sleeper task that blocks on
+    /// the IRQ-driven PIT. The harness must pass `false`: it runs with
+    /// interrupts disabled, where `time::sleep_ms` would never wake.
+    pub fn spawn_suite(include_sleeper: bool) -> Result<(), &'static str> {
         spawn("demo", demo_entry)?;
         spawn("stress", stress_entry)?;
         spawn("counter", counter_entry)?;
+        if include_sleeper {
+            spawn("sleeper", sleeper_entry)?;
+        }
         Ok(())
     }
 
     /// Prints three numbered lines, one per scheduling round, then exits by
     /// returning into the trampoline.
     extern "C" fn demo_entry() {
+        record_entry_if();
         let id = super::current_id();
         for line in 1..=3 {
             crate::terminal::print_fmt(format_args!(
@@ -631,6 +706,7 @@ pub mod demo {
     /// yield forces two full context switches (out via yield, back in via the
     /// scheduler), exercising the switch ABI 200+ times in a row.
     extern "C" fn stress_entry() {
+        record_entry_if();
         for _ in 0..STRESS_YIELD_COUNT {
             STRESS_YIELDS.fetch_add(1, Ordering::Relaxed);
             yield_now();
@@ -642,6 +718,7 @@ pub mod demo {
     /// stress task is done; then reports and exits. Verifies that repeated
     /// switches land back on the correct stack and frame every time.
     extern "C" fn counter_entry() {
+        record_entry_if();
         let mut rounds = 0u64;
         while !STRESS_DONE.load(Ordering::Relaxed) {
             rounds += 1;
@@ -652,6 +729,22 @@ pub mod demo {
             "[task] counter: stress finished after {} rounds ({} yields exercised the switch)\n",
             rounds,
             STRESS_YIELDS.load(Ordering::Relaxed)
+        ));
+    }
+
+    /// Sleeps on the IRQ-driven PIT (`time::sleep_ms` parks in `enable_and_hlt`
+    /// and only a timer interrupt can wake it), then reports the elapsed
+    /// ticks. Only spawned on the shell path: with interrupts disabled this
+    /// would sleep forever, which is exactly what makes it the live proof
+    /// that fresh tasks inherit the scheduling context's interrupt state.
+    extern "C" fn sleeper_entry() {
+        record_entry_if();
+        let before = crate::time::ticks();
+        crate::time::sleep_ms(250);
+        let elapsed_ms = (crate::time::ticks() - before) * 10;
+        crate::terminal::print_fmt(format_args!(
+            "[task] sleeper: IRQ-driven sleep returned after ~{} ms\n",
+            elapsed_ms
         ));
     }
 }

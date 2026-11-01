@@ -288,7 +288,7 @@ impl Shell {
         crate::terminal::print("  reboot   - Reboot the system\n");
         crate::terminal::print("  lspci    - List PCI devices (-v for details)\n");
         crate::terminal::print("  tasks    - List tasks (id, name, state)\n");
-        crate::terminal::print("  taskdemo - Spawn demo/stress/counter background tasks\n");
+        crate::terminal::print("  taskdemo - Spawn demo/stress/counter/sleeper tasks\n");
         crate::terminal::print("\nFilesystem Commands:\n");
         crate::terminal::print("  ls       - List directory contents\n");
         crate::terminal::print("  cd       - Change directory\n");
@@ -492,15 +492,15 @@ impl Shell {
         }
     }
 
-    /// Spawn the demo task suite (demo/stress/counter, see task::demo) and
-    /// return immediately: the tasks are only queued here — the main loop
-    /// runs them once this command handler has returned and the SHELL lock
-    /// is released, which is why nothing here may wait for them.
+    /// Spawn the demo task suite (demo/stress/counter/sleeper, see
+    /// task::demo) and return immediately: the tasks are only queued here —
+    /// the main loop runs them once this command handler has returned and the
+    /// SHELL lock is released, which is why nothing here may wait for them.
     fn cmd_taskdemo(&self) {
-        match crate::task::demo::spawn_suite() {
+        match crate::task::demo::spawn_suite(true) {
             Ok(()) => {
                 crate::terminal::print(
-                    "taskdemo: spawned demo, stress, counter — 3 tasks ready\n",
+                    "taskdemo: spawned demo, stress, counter, sleeper — 4 tasks ready\n",
                 );
             }
             Err(e) => {
