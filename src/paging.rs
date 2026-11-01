@@ -102,6 +102,31 @@ static mut PT_POOL: [AlignedPageTable; PT_POOL_SIZE] = [
 ];
 static PT_USED: AtomicUsize = AtomicUsize::new(0);
 
+// ---------------------------------------------------------------------------
+// User region (issue #19 stage 1)
+// ---------------------------------------------------------------------------
+
+/// PDPT index of the user 1 GiB window: 8 GiB..9 GiB. This sits under
+/// PML4[0] like the identity map but OUTSIDE the 0..6 GiB window the six
+/// page directories cover, so user virtual pages never alias identity-mapped
+/// RAM — a user page at 8 GiB only reaches memory through its own PTE.
+const USER_PDPT_INDEX: usize = 8;
+
+/// User code page: RX|USER. The embedded ring-3 demo blob is copied into a
+/// frame allocated at boot and mapped here.
+pub const USER_CODE_BASE: u64 = (USER_PDPT_INDEX as u64) << 30;
+
+/// User stack page: RW|NX|USER, 1 MiB above the code page — the same 2 MiB
+/// window, so one user page table serves both. Future user pages can grow
+/// within this window by filling more PTEs, or add page tables below.
+pub const USER_STACK_BASE: u64 = USER_CODE_BASE + 1024 * 1024;
+
+/// Page directory for the user 1 GiB window (`PDPT[USER_PDPT_INDEX]`).
+static mut USER_PD: AlignedPageTable = AlignedPageTable(PageTable::new());
+/// Page table for the first 2 MiB of the user window; PTE 0 = code page,
+/// PTE 256 = stack page. Empty (all non-present) until `map_user_pages`.
+static mut USER_PT: AlignedPageTable = AlignedPageTable(PageTable::new());
+
 /// Image bounds W^X was applied to (0/0 = unavailable/skipped). Published
 /// by [`init`] for diagnostics and controlled negative probes.
 static WX_IMAGE_BASE: AtomicU64 = AtomicU64::new(0);
@@ -530,6 +555,113 @@ fn wx_self_check() {
             "[pt] W^X verification FAILED: {} violation(s)\n",
             c.bad
         ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// User region: map + validate (issue #19 stage 1)
+// ---------------------------------------------------------------------------
+
+/// Map the two user pages onto freshly allocated frames. `code_pa` is
+/// mapped at [`USER_CODE_BASE`] as RX|USER (the demo blob), `stack_pa` at
+/// [`USER_STACK_BASE`] as RW|NX|USER. USER_ACCESSIBLE is set on every
+/// level along the path (PML4[0], PDPT[8], the PDE, both PTEs) — the CPU
+/// ANDs U/S across all levels, so kernel leaves, whose PTEs carry no USER
+/// bit, stay supervisor-only even though PML4[0] now has USER set.
+///
+/// Boot time only (interrupts disabled, single thread): the caller fills
+/// the frames through the 0..6 GiB identity map first — user VAs are not
+/// needed to write user memory. Flushes the whole TLB because a fresh
+/// top-level entry and two first-time translations race no stale state.
+pub fn map_user_pages(code_pa: u64, stack_pa: u64) -> Result<(), &'static str> {
+    if code_pa % 4096 != 0 || stack_pa % 4096 != 0 {
+        return Err("user frames must be 4 KiB aligned");
+    }
+    // Frames are filled through the identity map, so they must sit inside
+    // the 0..6 GiB window (the frame allocator is bounded to 4 GiB).
+    let map_limit = (PD_COUNT as u64) << 30;
+    if code_pa + 4096 > map_limit || stack_pa + 4096 > map_limit {
+        return Err("user frames outside the identity-mapped window");
+    }
+    let user_flags = base_flags() | PageTableFlags::USER_ACCESSIBLE;
+    unsafe {
+        let pml4 = &mut *(&raw mut PML4.0);
+        // Upper levels: no NO_EXECUTE — an NX bit on any level non-execs
+        // the whole subtree, and the user code page must stay executable.
+        let f = pml4[0].flags();
+        pml4[0].set_flags(f | PageTableFlags::USER_ACCESSIBLE);
+        (&mut *(&raw mut PDPT.0))[USER_PDPT_INDEX]
+            .set_frame(table_frame(&raw mut USER_PD.0), user_flags);
+        (&mut *(&raw mut USER_PD.0))[0].set_frame(table_frame(&raw mut USER_PT.0), user_flags);
+        let pt = &mut *(&raw mut USER_PT.0);
+        // Code: RX|USER (PRESENT, no WRITABLE, no NX).
+        pt[((USER_CODE_BASE >> 12) & 0x1FF) as usize]
+            .set_addr(PhysAddr::new(code_pa), PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE);
+        // Stack: RW|NX|USER.
+        pt[((USER_STACK_BASE >> 12) & 0x1FF) as usize].set_addr(
+            PhysAddr::new(stack_pa),
+            PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::NO_EXECUTE
+                | PageTableFlags::USER_ACCESSIBLE,
+        );
+    }
+    x86_64::instructions::tlb::flush_all();
+    crate::serial::print_fmt(format_args!(
+        "[pt] user region: code {:#x} -> {:#x} (RX|U), stack {:#x} -> {:#x} (RW|NX|U), PDPT[{}] linked, PML4[0].U\n",
+        USER_CODE_BASE, code_pa, USER_STACK_BASE, stack_pa, USER_PDPT_INDEX
+    ));
+    Ok(())
+}
+
+/// Walk the page tables for a user virtual address, enforcing U/S at
+/// every level. Returns `(page_base_pa, leaf_flags)`, or None when any
+/// level is not present or not user-accessible, or the leaf is a 2 MiB
+/// huge page (the user region is defined on 4 KiB pages only). This is
+/// the syscall-side validation of user buffers: a kernel address always
+/// fails because its leaf PTE has no USER bit.
+///
+/// Tables are statics in the identity map, so a table's physical address
+/// doubles as its virtual address.
+pub fn user_translate(va: u64) -> Option<(u64, PageTableFlags)> {
+    let present = PageTableFlags::PRESENT;
+    let user = PageTableFlags::USER_ACCESSIBLE;
+    unsafe {
+        let pml4 = &*(&raw const PML4.0);
+        let e = &pml4[((va >> 39) & 0x1FF) as usize];
+        if !e.flags().contains(present) || !e.flags().contains(user) {
+            return None;
+        }
+        let pdpt = &*(e.addr().as_u64() as *const PageTable);
+        let e = &pdpt[((va >> 30) & 0x1FF) as usize];
+        if !e.flags().contains(present) || !e.flags().contains(user) {
+            return None;
+        }
+        let pd = &*(e.addr().as_u64() as *const PageTable);
+        let e = &pd[((va >> 21) & 0x1FF) as usize];
+        if !e.flags().contains(present)
+            || !e.flags().contains(user)
+            || e.flags().contains(PageTableFlags::HUGE_PAGE)
+        {
+            return None;
+        }
+        let pt = &*(e.addr().as_u64() as *const PageTable);
+        let e = &pt[((va >> 12) & 0x1FF) as usize];
+        if !e.flags().contains(present) || !e.flags().contains(user) {
+            return None;
+        }
+        Some((e.addr().as_u64(), e.flags()))
+    }
+}
+
+/// Whether the user window is linked into the current page tables
+/// (PDPT[8] present). `map_user_pages` sets this up once at boot; the
+/// shell's `usermode` command refuses to enter ring 3 without it.
+pub fn user_region_mapped() -> bool {
+    unsafe {
+        (&*(&raw const PDPT.0))[USER_PDPT_INDEX]
+            .flags()
+            .contains(PageTableFlags::PRESENT)
     }
 }
 

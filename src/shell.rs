@@ -231,6 +231,8 @@ impl Shell {
             "diskread" => self.cmd_with_required_path("diskread", args, Self::cmd_diskread),
             "tasks" => self.cmd_tasks(),
             "taskdemo" => self.cmd_taskdemo(),
+            // Ring-3 demo (issue #19 stage 1)
+            "usermode" => self.cmd_usermode(),
             // Filesystem commands with unified argument handling
             "ls" => self.cmd_ls(self.get_first_arg(args, "")),
             "cd" => self.cmd_cd(self.get_first_arg(args, "/")),
@@ -298,6 +300,7 @@ impl Shell {
         crate::terminal::print("  diskread - Hex dump a 512-byte data-disk sector\n");
         crate::terminal::print("  tasks    - List tasks (id, name, state)\n");
         crate::terminal::print("  taskdemo - Spawn demo/stress/counter/sleeper tasks\n");
+        crate::terminal::print("  usermode - Run the embedded ring-3 program (int 0x80 write/exit)\n");
         crate::terminal::print("\nFilesystem Commands:\n");
         crate::terminal::print("  ls       - List directory contents\n");
         crate::terminal::print("  cd       - Change directory\n");
@@ -658,6 +661,15 @@ impl Shell {
                 crate::terminal::print("\n");
             }
         }
+    }
+
+    /// Ring-3 execution demo (issue #19 stage 1): iretq to the embedded
+    /// user program, which prints via `write(1, buf, len)` and leaves via
+    /// `exit(code)` — both `int 0x80` syscalls — and resume the kernel
+    /// context when it exits. Synchronous: no scheduling, no second
+    /// address space; a user fault panics (see src/usermode.rs).
+    fn cmd_usermode(&self) {
+        crate::usermode::run_demo();
     }
     
     // Filesystem commands

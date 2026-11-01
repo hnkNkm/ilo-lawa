@@ -326,6 +326,18 @@ pub extern "C" fn kernel_main_owned() -> ! {
     crate::allocator::init_heap_from_memory();
     crate::terminal::print(" [OK]\n");
 
+    // Map the user region for ring-3 execution (issue #19 stage 1): two
+    // frames from the allocator, mapped at 8 GiB as user code (RX|USER)
+    // and user stack (RW|NX|USER). Runs with interrupts still disabled, so
+    // no IRQ can walk the user page tables mid-build; a failure only logs
+    // and disables the `usermode` command.
+    crate::terminal::print("Mapping user region (ring 3)...");
+    if crate::usermode::init() {
+        crate::terminal::print(" [OK]\n");
+    } else {
+        crate::terminal::print(" [--] unavailable\n");
+    }
+
     // Enumerate the PCI bus (issue #23): plain port I/O (0xCF8/0xCFC) into
     // a fixed static table, so it needs no page-table work and no heap.
     // Discovery only — no bus mastering, no BAR mapping. Takes no
