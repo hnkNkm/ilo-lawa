@@ -57,35 +57,6 @@ const MAX_WRITE_LEN: u64 = 64 * 1024;
 /// [`enter_user`]). Single-threaded around the ring-3 excursion.
 static EXIT_CODE: AtomicU64 = AtomicU64::new(0);
 
-/// Saved kernel context for the `exit` return path, laid out so that
-/// `lea rsp, [ctx+8]; iretq` pops it in hardware order. `user_cs`/
-/// `user_ss` are the ring-3 selectors for the iretq frame *into* user
-/// mode; `kernel_*` are written by the asm in `ilo_usermode_enter` and
-/// consumed by `ilo_usermode_resume`. Only touched on the synchronous
-/// kernel thread while executing `usermode`.
-#[repr(C)]
-struct ResumeCtx {
-    user_cs: u16,
-    user_ss: u16,
-    _pad: u32,
-    kernel_rip: u64,
-    kernel_cs: u64,
-    kernel_rflags: u64,
-    kernel_rsp: u64,
-    kernel_ss: u64,
-}
-
-static mut RESUME_CTX: ResumeCtx = ResumeCtx {
-    user_cs: 0,
-    user_ss: 0,
-    _pad: 0,
-    kernel_rip: 0,
-    kernel_cs: 0,
-    kernel_rflags: 0,
-    kernel_rsp: 0,
-    kernel_ss: 0,
-};
-
 /// Physical address of the user code frame (identity-mapped, so the kernel
 /// can (re)fill it directly).
 static CODE_FRAME_PA: AtomicU64 = AtomicU64::new(0);
@@ -321,11 +292,29 @@ global_asm!(
     "iretq", // back to ring 3: pops RIP/CS/RFLAGS/RSP/SS
 
     // -- enter ring 3 (called from Rust, win64) -------------------------
-    // (user_rip: rcx, user_rsp: rdx, ctx: r8). Fills the kernel half of
-    // ctx, then iretqs to (user_cs, user_rip) on the user stack with
-    // IF=1. Must not be interrupted between cli and iretq.
+    // (user_rip: rcx, user_rsp: rdx, ctx: r8). Preserves the kernel's
+    // Microsoft x64 nonvolatile state across the excursion — user code
+    // (and anything it faults on) may trash all of it: RBX/RBP/RDI/RSI/
+    // R12-R15 are pushed, and FXSAVE spills x87 + MXCSR + all XMM (CR4.
+    // OSFXSR is on since cpu::init; 64-bit-mode FXSAVE covers XMM0-15).
+    // The iretq frame into user mode is built only after the saves, so
+    // ctx.kernel_rsp points at the spill area and the exit syscall's
+    // iretq resumes exactly at `.ilo_kernel_resume` with the full
+    // restore still pending. Must not be interrupted between cli and
+    // iretq.
     ".globl ilo_usermode_enter",
     "ilo_usermode_enter:",
+    "push rbx",
+    "push rbp",
+    "push rdi",
+    "push rsi",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "sub rsp, 8", // re-align: entry RSP = 8 (mod 16), +64 +8 keeps the
+    "sub rsp, 512", // ...FXSAVE area 16-byte aligned
+    "fxsave [rsp]",
     // ResumeCtx: 0 user_cs, 2 user_ss, 8 kernel_rip, 16 kernel_cs,
     // 24 kernel_rflags, 32 kernel_rsp, 40 kernel_ss.
     "lea rax, [rip + .ilo_kernel_resume]",
@@ -351,8 +340,20 @@ global_asm!(
     "push rcx", // user RIP
     "iretq",
     // Landed here only from `exit`'s iretq with the kernel context
-    // restored (RSP = the value snapshotted above). Return to Rust.
+    // restored (RSP = the value snapshotted above, at the FXSAVE area).
+    // Restore the kernel's FP/SIMD control+register state and the
+    // nonvolatile GPRs, then return to the Rust caller.
     ".ilo_kernel_resume:",
+    "fxrstor [rsp]",
+    "add rsp, 520",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rsi",
+    "pop rdi",
+    "pop rbp",
+    "pop rbx",
     "ret",
 
     // -- resume kernel after exit(2) (called from the dispatcher) -------
@@ -364,14 +365,44 @@ global_asm!(
     "iretq",
 );
 
-extern "C" {
-    fn ilo_usermode_enter(user_rip: u64, user_rsp: u64, ctx: *mut ResumeCtx);
-    fn ilo_usermode_resume(ctx: *const ResumeCtx) -> !;
+
+/// Saved kernel context for the `exit` return path, laid out so that
+/// `lea rsp, [ctx+8]; iretq` pops it in hardware order. `user_cs`/
+/// `user_ss` are the ring-3 selectors for the iretq frame *into* user
+/// mode; `kernel_*` are written by the asm in `ilo_usermode_enter` and
+/// consumed by `ilo_usermode_resume`. Only touched on the synchronous
+/// kernel thread while executing `usermode`.
+#[repr(C)]
+struct ResumeCtx {
+    user_cs: u16,
+    user_ss: u16,
+    _pad: u32,
+    kernel_rip: u64,
+    kernel_cs: u64,
+    kernel_rflags: u64,
+    kernel_rsp: u64,
+    kernel_ss: u64,
 }
+
+static mut RESUME_CTX: ResumeCtx = ResumeCtx {
+    user_cs: 0,
+    user_ss: 0,
+    _pad: 0,
+    kernel_rip: 0,
+    kernel_cs: 0,
+    kernel_rflags: 0,
+    kernel_rsp: 0,
+    kernel_ss: 0,
+};
 
 /// Address of the asm `int 0x80` handler, for the IDT gate.
 pub fn int80_entry_addr() -> u64 {
     ilo_int80_entry as *const () as u64
+}
+
+extern "C" {
+    fn ilo_usermode_enter(user_rip: u64, user_rsp: u64, ctx: *mut ResumeCtx);
+    fn ilo_usermode_resume(ctx: *const ResumeCtx) -> !;
 }
 
 extern "C" {
