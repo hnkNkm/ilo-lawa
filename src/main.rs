@@ -7,6 +7,7 @@ extern crate alloc;
 
 use uefi::prelude::*;
 use uefi::proto::console::gop::GraphicsOutput;
+use uefi::proto::loaded_image::LoadedImage;
 
 mod font;
 mod kernel;
@@ -31,7 +32,7 @@ use kernel::{FramebufferInfo, kernel_main};
 use core::panic::PanicInfo;
 
 #[entry]
-fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
+fn main(image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     
     // Display boot message
     system_table.stdout().clear().unwrap();
@@ -68,6 +69,20 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
         .stdout()
         .output_string(cstr16!("Framebuffer info saved.\r\n"))
         .unwrap();
+    // Loaded-image bounds, captured BEFORE ExitBootServices: paging::init
+    // needs them for the W^X section mapping. (0/0) means unavailable;
+    // W^X is then skipped with a log.
+    let image_info = {
+        let bt = system_table.boot_services();
+        match bt.open_protocol_exclusive::<LoadedImage>(image_handle) {
+            Ok(li) => {
+                let (base, size) = li.info();
+                kernel::ImageInfo { base: base as u64, size }
+            }
+            Err(_) => kernel::ImageInfo { base: 0, size: 0 },
+        }
+    };
+
     system_table
         .stdout()
         .output_string(cstr16!("Calling ExitBootServices...\r\n"))
@@ -81,7 +96,7 @@ fn main(_image_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
     // WE ARE NOW IN KERNEL MODE!
     // No more UEFI services, we're on our own
-    kernel_main(fb_info, memory_map);
+    kernel_main(fb_info, memory_map, image_info);
 }
 
 #[panic_handler]
