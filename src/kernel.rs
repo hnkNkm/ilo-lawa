@@ -291,9 +291,20 @@ pub extern "C" fn kernel_main_owned() -> ! {
     crate::paging::init(fb_info, &args.memory_map, args.image);
     crate::terminal::print(" [OK]\n");
 
-    // Initialize heap allocator
+    // Retain the UEFI memory map and bring up the physical frame
+    // allocator BEFORE the heap (thread context, interrupts still
+    // disabled): the frame summary/self-check must run on the untouched
+    // pool, and the heap below is carved out of that same pool.
+    crate::terminal::print("Initializing memory management...\n");
+    crate::memory::init(&args.memory_map);
+    crate::terminal::print(" [OK]\n");
+
+    // Size the heap from conventional RAM and reserve its backing frames
+    // (static 1 MiB fallback if no contiguous run exists). This must
+    // happen before the filesystem and shell below — the first heap
+    // users — ever allocate.
     crate::terminal::print("Initializing heap allocator...");
-    crate::allocator::init_heap();
+    crate::allocator::init_heap_from_memory();
     crate::terminal::print(" [OK]\n");
     
     // Initialize CPU features (FPU, SSE)
@@ -314,12 +325,6 @@ pub extern "C" fn kernel_main_owned() -> ! {
     // Initialize PIC
     crate::terminal::print("Initializing PIC...");
     unsafe { crate::pic::PICS.lock().initialize() };
-    crate::terminal::print(" [OK]\n");
-
-    // Retain the UEFI memory map and bring up the physical frame
-    // allocator (thread context, interrupts still disabled)
-    crate::terminal::print("Initializing memory management...\n");
-    crate::memory::init(&args.memory_map);
     crate::terminal::print(" [OK]\n");
 
     // Initialize filesystem BEFORE enabling interrupts: its allocations

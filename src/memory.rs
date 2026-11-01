@@ -8,9 +8,10 @@
 //      usable (CONVENTIONAL) regions. Frames are 4 KiB physical pages used
 //      at their identity-mapped physical addresses — no paging layer yet.
 //
-// `allocate_frame`/`free_frame` are unused until the paging/tasking stages
-// of issue #5/#18 land; they are kept with the same `dead_code` allowance
-// kernel.rs uses for forward-looking code.
+// `allocate_contiguous` (via `reserve_frames`) backs the kernel heap at
+// boot; `allocate_frame`/`free_frame` are otherwise unused until the
+// paging/tasking stages of issue #5/#18 land. They are kept with the same
+// `dead_code` allowance kernel.rs uses for forward-looking code.
 #![allow(dead_code)]
 
 // LOCKING (single-core kernel): both globals are `spin::Mutex`es. The CPU
@@ -142,6 +143,57 @@ impl BitmapFrameAllocator {
         None
     }
 
+    /// Reserve `frames` consecutive free 4 KiB frames and mark them used.
+    /// Returns the physical base address of the run (identity-mapped — no
+    /// paging layer offsets addresses), or `None` when the pool is too
+    /// fragmented or too small to satisfy the request.
+    ///
+    /// First-fit scan over the bitmap for the first run of `frames` clear
+    /// bits: O(FRAME_COUNT) at worst, no allocation (safe before and
+    /// during heap bring-up). The pre-check on `free_frames` guarantees
+    /// the counter decrement cannot underflow.
+    pub fn allocate_contiguous(&mut self, frames: usize) -> Option<u64> {
+        if frames == 0 || frames as u64 > self.free_frames {
+            return None;
+        }
+        let mut run_start = 0usize;
+        let mut run_len = 0usize;
+        for (word_idx, &word) in self.bitmap.iter().enumerate() {
+            if word == u64::MAX {
+                // Fully-used word breaks any open run.
+                run_len = 0;
+                continue;
+            }
+            // Runs carry across word boundaries (mixed and fully-free
+            // words are scanned bit by bit).
+            for bit in 0..64 {
+                if word & (1u64 << bit) == 0 {
+                    if run_len == 0 {
+                        run_start = word_idx * 64 + bit;
+                    }
+                    run_len += 1;
+                    if run_len == frames {
+                        self.mark_run_used(run_start, frames);
+                        self.free_frames -= frames as u64;
+                        return Some(run_start as u64 * FRAME_SIZE);
+                    }
+                } else {
+                    run_len = 0;
+                }
+            }
+        }
+        None
+    }
+
+    /// Mark `frames` consecutive bits starting at `start_frame` used.
+    /// Callers guarantee the run lies inside the bitmap.
+    fn mark_run_used(&mut self, start_frame: usize, frames: usize) {
+        for frame in start_frame..start_frame + frames {
+            let word = frame / 64;
+            self.bitmap[word] |= 1u64 << (frame % 64);
+        }
+    }
+
     /// Return a previously allocated frame to the pool. Callers must only
     /// free frames obtained from `allocate_frame`; the bounds/alignment
     /// check here is a guard against corruption, not a region-ownership
@@ -166,6 +218,21 @@ impl BitmapFrameAllocator {
     pub fn usable_frame_count(&self) -> u64 {
         self.usable_frames
     }
+}
+
+/// Reserve `frames` consecutive free frames for a long-lived allocation
+/// (the kernel heap, future page-table pools). Locks `FRAME_ALLOCATOR`;
+/// thread context only. The frames stay reserved: bits are set and the
+/// free counter decremented, so no later frame allocation can hand them
+/// out again. Returns the physical base address of the run.
+pub fn reserve_frames(frames: usize) -> Option<u64> {
+    FRAME_ALLOCATOR.lock().allocate_contiguous(frames)
+}
+
+/// Frames currently free in the pool. Locks `FRAME_ALLOCATOR`;
+/// thread context only.
+pub fn free_frame_count() -> u64 {
+    FRAME_ALLOCATOR.lock().free_frame_count()
 }
 
 /// Retain the memory map handed back by ExitBootServices and bring up the
@@ -255,6 +322,34 @@ fn self_check(allocator: &mut BitmapFrameAllocator) {
         after == before,
         "frame allocator self-check: free count {} did not return to {}",
         after,
+        before
+    );
+
+    // Contiguous reservation: the same invariants for a multi-frame run,
+    // exercised the way the heap bring-up reserves its backing frames.
+    const RUN: usize = 4;
+    let run = allocator
+        .allocate_contiguous(RUN)
+        .expect("frame allocator self-check: no contiguous 4-frame run right after init");
+    assert!(
+        run % FRAME_SIZE == 0,
+        "frame allocator self-check: run {:#x} not 4 KiB-aligned",
+        run
+    );
+    assert!(
+        run + RUN as u64 * FRAME_SIZE <= MAX_SUPPORTED_PHYS,
+        "frame allocator self-check: run {:#x}..{:#x} outside the 4 GiB window",
+        run,
+        run + RUN as u64 * FRAME_SIZE
+    );
+    for i in 0..RUN {
+        allocator.free_frame(run + i as u64 * FRAME_SIZE);
+    }
+    let after_run = allocator.free_frame_count();
+    assert!(
+        after_run == before,
+        "frame allocator self-check: free count {} did not return to {} after the contiguous run",
+        after_run,
         before
     );
     terminal::print("Frame allocator self-check OK\n");
