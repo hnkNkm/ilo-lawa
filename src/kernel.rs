@@ -325,7 +325,18 @@ pub extern "C" fn kernel_main_owned() -> ! {
     crate::terminal::print("Initializing heap allocator...");
     crate::allocator::init_heap_from_memory();
     crate::terminal::print(" [OK]\n");
-    
+
+    // Enumerate the PCI bus (issue #23): plain port I/O (0xCF8/0xCFC) into
+    // a fixed static table, so it needs no page-table work and no heap.
+    // Discovery only — no bus mastering, no BAR mapping. Takes no
+    // ISR-shared lock, so placement anywhere in init is safe.
+    crate::terminal::print("Enumerating PCI bus...");
+    let pci_devices = crate::drivers::pci::init();
+    crate::terminal::print_fmt(format_args!(
+        " [OK] {} device(s)\n",
+        pci_devices
+    ));
+
     // Initialize CPU features (FPU, SSE)
     crate::terminal::print("Initializing CPU features...");
     crate::cpu::init();

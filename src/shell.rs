@@ -225,6 +225,7 @@ impl Shell {
             "history" => self.cmd_history(),
             "shutdown" => self.cmd_shutdown(),
             "reboot" => self.cmd_reboot(),
+            "lspci" => self.cmd_lspci(args),
             // Filesystem commands with unified argument handling
             "ls" => self.cmd_ls(self.get_first_arg(args, "")),
             "cd" => self.cmd_cd(self.get_first_arg(args, "/")),
@@ -283,6 +284,7 @@ impl Shell {
         crate::terminal::print("  history  - Show command history\n");
         crate::terminal::print("  shutdown - Shutdown the system\n");
         crate::terminal::print("  reboot   - Reboot the system\n");
+        crate::terminal::print("  lspci    - List PCI devices (-v for details)\n");
         crate::terminal::print("\nFilesystem Commands:\n");
         crate::terminal::print("  ls       - List directory contents\n");
         crate::terminal::print("  cd       - Change directory\n");
@@ -312,6 +314,74 @@ impl Shell {
     fn cmd_version(&self) {
         crate::terminal::print(concat!("ilo-lawa OS v", env!("CARGO_PKG_VERSION"), "\n"));
         crate::terminal::print("Built with Rust and UEFI\n");
+    }
+
+    // List the devices found by pci::init() at boot (issue #23). Default
+    // output is one line per function: bus:dev.func vendor:device
+    // class:subclass prog_if, with virtio-blk devices marked; they also
+    // get their BAR0/IRQ printed since that is what the block-driver work
+    // (issue #14) needs. `lspci -v` prints every non-zero BAR plus IRQ
+    // routing for all devices.
+    fn cmd_lspci(&self, args: &[&str]) {
+        let verbose = args.iter().any(|arg| *arg == "-v" || *arg == "--verbose");
+        let mut count = 0usize;
+        crate::drivers::pci::for_each_device(|dev| {
+            count += 1;
+            let marker = if dev.is_virtio_block() { "  [virtio-blk]" } else { "" };
+            crate::terminal::print_fmt(format_args!(
+                "{:02x}:{:02x}.{} {:04x}:{:04x} {:02x}:{:02x} {:02x}{}\n",
+                dev.bus,
+                dev.device,
+                dev.function,
+                dev.vendor_id,
+                dev.device_id,
+                dev.class_code,
+                dev.subclass,
+                dev.prog_if,
+                marker,
+            ));
+            if verbose || dev.is_virtio_block() {
+                let bar_count = if verbose { dev.bars.len() } else { 1 };
+                // Step by hand: a 64-bit memory BAR consumes two slots and
+                // is printed as one joined address instead of two raw
+                // halves.
+                let mut i = 0;
+                while i < bar_count {
+                    let bar = dev.bars[i];
+                    if bar == 0 {
+                        i += 1;
+                        continue;
+                    }
+                    if dev.bar_is_64bit(i) && i + 1 < dev.bars.len() {
+                        let base =
+                            (u64::from(dev.bars[i + 1]) << 32) | u64::from(dev.bar_base(i));
+                        crate::terminal::print_fmt(format_args!(
+                            "    BAR{} mem64 @ {:#x}\n",
+                            i, base,
+                        ));
+                        i += 2;
+                    } else {
+                        let kind = if dev.bar_is_io(i) { "io" } else { "mem" };
+                        crate::terminal::print_fmt(format_args!(
+                            "    BAR{} {} @ {:#x}\n",
+                            i,
+                            kind,
+                            dev.bar_base(i),
+                        ));
+                        i += 1;
+                    }
+                }
+                crate::terminal::print_fmt(format_args!(
+                    "    IRQ line {} pin {}\n",
+                    dev.interrupt_line,
+                    dev.interrupt_pin,
+                ));
+            }
+        });
+        if crate::drivers::pci::overflowed() {
+            crate::terminal::print("(device table full, some functions not listed)\n");
+        }
+        crate::terminal::print_fmt(format_args!("{} device(s)\n", count));
     }
     
     fn cmd_uptime(&self) {

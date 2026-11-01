@@ -24,6 +24,7 @@ mod shell;
 mod fs;
 mod memory;
 mod paging;
+mod drivers;
 mod acpi;
 mod stacks;
 #[cfg(feature = "test-harness")]
