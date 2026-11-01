@@ -64,6 +64,28 @@ static mut DOUBLE_FAULT_STACK: StackRegion = StackRegion {
     _bytes: [0; REGION_STORAGE],
 };
 
+/// 64 KiB kernel stack for every CPU transition from ring 3 to ring 0
+/// (issue #19 stage 1). The `int 0x80` syscall gate lands here, and so do
+/// timer/keyboard and all other IRQs that fire while user code runs: for
+/// any interrupt or exception taken at CPL 3 the CPU loads this stack top
+/// from `TSS.privilege_stack_table[0]` (src/gdt.rs) and pushes the
+/// interrupt frame on it. Ring-0 execution never switches to it — at
+/// CPL 0 the CPU keeps the interrupted stack. The stack is 16-byte
+/// aligned as the x86-64 interrupt-frame contract expects, has no guard
+/// half (unlike the regions above: it is only ever touched by short
+/// handlers, never grown by nested kernel code) and is re-entered from
+/// the top on every transition, so per-interrupt scratch is transient.
+const SYSCALL_STACK_BYTES: usize = 64 * 1024;
+
+#[repr(C, align(4096))]
+struct SyscallStack {
+    _bytes: [u8; SYSCALL_STACK_BYTES],
+}
+
+static mut SYSCALL_STACK: SyscallStack = SyscallStack {
+    _bytes: [0; SYSCALL_STACK_BYTES],
+};
+
 /// One-time check that both region windows sit inside their storage arrays.
 /// Cheap (a few comparisons, no allocation); called from
 /// [`switch_to_kernel_stack`] for the main stack, and available for the
@@ -120,6 +142,12 @@ pub fn double_fault_stack_base() -> u64 {
 #[allow(dead_code)]
 pub fn double_fault_stack_top() -> u64 {
     region_window(&raw const DOUBLE_FAULT_STACK).1
+}
+
+/// Top of the ring-3 transition stack (`TSS.privilege_stack_table[0]`).
+/// Page-aligned storage plus a 64 KiB size keeps this 16-byte aligned.
+pub fn syscall_stack_top() -> u64 {
+    &raw const SYSCALL_STACK as u64 + SYSCALL_STACK_BYTES as u64
 }
 
 /// Current RSP. Diagnostics only (serial boot-log checkpoints).

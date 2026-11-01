@@ -185,6 +185,45 @@ impl BitmapFrameAllocator {
         None
     }
 
+    /// Like [`allocate_contiguous`], but the returned run must start at
+    /// or above `min_pa`: frames below are skipped without being touched,
+    /// so callers can stay clear of the historic low pages without
+    /// consuming anything. First-fit scan from `min_pa` upward.
+    pub fn allocate_contiguous_above(&mut self, min_pa: u64, frames: usize) -> Option<u64> {
+        if frames == 0 || frames as u64 > self.free_frames {
+            return None;
+        }
+        let min_frame = (min_pa / FRAME_SIZE) as usize;
+        let mut run_start = 0usize;
+        let mut run_len = 0usize;
+        for (word_idx, &word) in self.bitmap.iter().enumerate() {
+            if word == u64::MAX {
+                run_len = 0;
+                continue;
+            }
+            for bit in 0..64 {
+                let frame = word_idx * 64 + bit;
+                if frame < min_frame {
+                    continue;
+                }
+                if word & (1u64 << bit) == 0 {
+                    if run_len == 0 {
+                        run_start = frame;
+                    }
+                    run_len += 1;
+                    if run_len == frames {
+                        self.mark_run_used(run_start, frames);
+                        self.free_frames -= frames as u64;
+                        return Some(run_start as u64 * FRAME_SIZE);
+                    }
+                } else {
+                    run_len = 0;
+                }
+            }
+        }
+        None
+    }
+
     /// Mark `frames` consecutive bits starting at `start_frame` used.
     /// Callers guarantee the run lies inside the bitmap.
     fn mark_run_used(&mut self, start_frame: usize, frames: usize) {
@@ -227,6 +266,16 @@ impl BitmapFrameAllocator {
 /// out again. Returns the physical base address of the run.
 pub fn reserve_frames(frames: usize) -> Option<u64> {
     FRAME_ALLOCATOR.lock().allocate_contiguous(frames)
+}
+
+/// Reserve `frames` consecutive free frames starting at or above
+/// `min_pa` (frames below are skipped, not consumed). Locks
+/// `FRAME_ALLOCATOR`; thread context only. Used by the usermode stage so
+/// the ring-3 code/stack frames never land in the historic low pages a
+/// fragmented UEFI map may offer as free CONVENTIONAL RAM (issue #19
+/// stage 1).
+pub fn reserve_frames_above(min_pa: u64, frames: usize) -> Option<u64> {
+    FRAME_ALLOCATOR.lock().allocate_contiguous_above(min_pa, frames)
 }
 
 /// Frames currently free in the pool. Locks `FRAME_ALLOCATOR`;

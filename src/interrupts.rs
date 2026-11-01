@@ -39,6 +39,18 @@ lazy_static! {
         idt[45].set_handler_fn(irq13_handler);
         idt[46].set_handler_fn(irq14_handler);
         idt[47].set_handler_fn(spurious_irq15_handler);
+
+        // int 0x80: ring-3 syscall gate (issue #19 stage 1). DPL 3 lets
+        // user code raise the vector; the handler is the global-asm entry
+        // in src/usermode.rs (a naked asm label, not an
+        // `extern "x86-interrupt"` fn: it must see the raw CPU frame and
+        // preserve the user GPRs itself). No IST — entries from CPL 3
+        // switch to TSS.privilege_stack_table[0].
+        unsafe {
+            idt[0x80]
+                .set_handler_addr(x86_64::VirtAddr::new(crate::usermode::int80_entry_addr()))
+                .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+        }
         idt
     };
 }

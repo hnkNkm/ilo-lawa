@@ -29,6 +29,7 @@ mod drivers;
 mod acpi;
 mod stacks;
 mod task;
+mod usermode;
 #[cfg(feature = "test-harness")]
 mod test_harness;
 
