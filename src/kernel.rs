@@ -13,6 +13,15 @@ pub struct FramebufferInfo {
     pub stride: usize,
 }
 
+// Loaded-image bounds captured before ExitBootServices (LoadedImage
+// protocol). Zeroed when the protocol could not be opened; paging::init
+// skips W^X in that case.
+#[derive(Clone, Copy)]
+pub struct ImageInfo {
+    pub base: u64,
+    pub size: u64,
+}
+
 // Simple kernel graphics driver
 pub struct KernelGraphics {
     fb_info: FramebufferInfo,
@@ -129,6 +138,7 @@ impl KernelGraphics {
 struct BootArgs {
     fb_info: FramebufferInfo,
     memory_map: uefi::table::boot::MemoryMap<'static>,
+    image: ImageInfo,
 }
 
 static BOOT_ARGS: Once<BootArgs> = Once::new();
@@ -139,7 +149,11 @@ static BOOT_ARGS: Once<BootArgs> = Once::new();
 // `kernel_main_owned`, so not a single init step runs on firmware stack
 // memory. No UEFI memory is reserved for the abandoned stack, so the frame
 // allocator (brought up later, in memory::init) starts from a clean slate.
-pub fn kernel_main(fb_info: FramebufferInfo, memory_map: uefi::table::boot::MemoryMap<'static>) -> ! {
+pub fn kernel_main(
+    fb_info: FramebufferInfo,
+    memory_map: uefi::table::boot::MemoryMap<'static>,
+    image: ImageInfo,
+) -> ! {
     // CRITICAL: Disable interrupts immediately after ExitBootServices
     x86_64::instructions::interrupts::disable();
 
@@ -149,7 +163,7 @@ pub fn kernel_main(fb_info: FramebufferInfo, memory_map: uefi::table::boot::Memo
 
     // Park the boot arguments, then leave the firmware stack for good.
     let firmware_rsp = crate::stacks::current_stack_pointer();
-    BOOT_ARGS.call_once(|| BootArgs { fb_info, memory_map });
+    BOOT_ARGS.call_once(|| BootArgs { fb_info, memory_map, image });
     let kernel_top = crate::stacks::main_stack_top();
     crate::serial::print_fmt(format_args!(
         "[stack] firmware rsp={:#x} -> kernel-owned stack top={:#x}, switching\n",
@@ -192,7 +206,7 @@ pub extern "C" fn kernel_main_owned() -> ! {
     // regions and marks the framebuffer MMIO uncached, before anything else
     // allocates or maps memory (see src/paging.rs).
     crate::terminal::print("Installing kernel page tables...");
-    crate::paging::init(fb_info, &args.memory_map);
+    crate::paging::init(fb_info, &args.memory_map, args.image);
     crate::terminal::print(" [OK]\n");
 
     // Initialize heap allocator
@@ -214,7 +228,7 @@ pub extern "C" fn kernel_main_owned() -> ! {
     crate::terminal::print("Initializing IDT...");
     crate::interrupts::init();
     crate::terminal::print(" [OK]\n");
-    
+
     // Initialize PIC
     crate::terminal::print("Initializing PIC...");
     unsafe { crate::pic::PICS.lock().initialize() };
